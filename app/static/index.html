@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>存储卡备份控制台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📷</text></svg>">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">📷</span>
+    <div>
+      <h1>存储卡备份控制台</h1>
+      <p class="sub">插卡即自动增量备份 · 绿联 NAS</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="conn" class="conn off"><i></i>连接中…</span>
+    <button class="btn ghost" data-action="rescan">重新扫描设备</button>
+  </div>
+</header>
+
+<main>
+  <section id="hero" class="hero card">
+    <div class="hero-idle"><div class="big">正在连接后端…</div></div>
+  </section>
+
+  <section id="stats" class="stats"></section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="dash">概览</button>
+    <button class="tab" data-tab="cards">存储卡</button>
+    <button class="tab" data-tab="tasks">任务记录</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
+
+  <section id="tab-dash" class="tabpane active">
+    <div class="card">
+      <h2>卡片备份汇总</h2>
+      <div id="cards-summary"></div>
+    </div>
+    <div class="card">
+      <h2>最近任务</h2>
+      <div id="dash-tasks"></div>
+    </div>
+  </section>
+
+  <section id="tab-cards" class="tabpane">
+    <div class="card">
+      <h2>当前检测到的设备
+        <button class="btn sm ghost" data-action="diagnose" style="float:right;margin-top:-4px">运行环境自检</button>
+      </h2>
+      <p class="hint">实时列出外接存储设备（USB 读卡器 / 内置 SD 槽）。检测不到时，点右上角「运行环境自检」获取诊断信息。</p>
+      <div id="devices"></div>
+    </div>
+    <div class="card">
+      <h2>已注册的存储卡（白名单）</h2>
+      <p class="hint">只有注册且启用的卡插入时才自动备份；每张卡按身份 ID 识别，同名不同卡也不会混淆。</p>
+      <div id="cards-table"></div>
+    </div>
+  </section>
+
+  <section id="tab-tasks" class="tabpane">
+    <div class="card">
+      <h2>任务记录</h2>
+      <p class="hint">保留最近 200 条任务。失败/部分失败的任务可查看具体文件错误，或插入卡后一键重试。</p>
+      <div id="tasks-full"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="tabpane">
+    <div class="card">
+      <h2>运行设置</h2>
+      <form id="settings-form" class="form-grid" autocomplete="off">
+        <label>设备扫描间隔（秒）
+          <input type="number" id="s-scan_interval" min="1" max="120" step="1">
+          <small>检测插卡/拔卡的轮询频率，1-120 秒。</small>
+        </label>
+        <label>插卡后等待时间（秒）
+          <input type="number" id="s-mount_delay" min="0" max="300" step="1">
+          <small>识别到卡后等待若干秒再挂载，避免系统识别未完成，0-300 秒。</small>
+        </label>
+        <label class="switch-line">复制完成后校验哈希（推荐）
+          <span class="switch"><input type="checkbox" id="s-verify"><i></i></span>
+          <small>重读目标文件比对哈希，防止拷贝静默损坏；会略微增加耗时。</small>
+        </label>
+        <label class="switch-line">备份完成后自动卸载
+          <span class="switch"><input type="checkbox" id="s-auto_unmount"><i></i></span>
+          <small>完成后卸载存储卡，可安全拔出；关闭则保持挂载（可在概览页手动卸载）。</small>
+        </label>
+        <label class="switch-line">自动接受未注册的卡（谨慎）
+          <span class="switch"><input type="checkbox" id="s-auto_accept"><i></i></span>
+          <small>开启后任何卡插入都会自动注册并备份；默认关闭 = 只备份白名单内的卡。</small>
+        </label>
+        <label>完成通知 Webhook（可选）
+          <input type="text" id="s-notify_url" placeholder="https://...">
+          <small>自动适配多种渠道（详见 README）：PushPlus（微信）／mails.dev、SMTP 直发（邮箱，无需服务器）／企业微信·钉钉机器人／Server 酱。示例：https://api.mails.dev/v1/send?key=mk_xxx&amp;to=you@example.com</small>
+        </label>
+        <div class="form-foot">
+          <button class="btn" type="submit">保存设置</button>
+          <span id="settings-status" class="muted"></span>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>关于本程序</h2>
+      <ul class="about">
+        <li>备份目录结构：<span class="mono">/backup/卡片别名/…</span>（按日期分目录或保留卡内原结构，逐卡可选）</li>
+        <li>存储卡以 <b>只读方式</b>挂载，程序不会向卡内写入、删除任何内容</li>
+        <li>增量依据：本地 SQLite 索引（路径 + 大小 + 修改时间 + 内容哈希），拔卡中断后重插会自动续传</li>
+        <li>管理界面仅供局域网使用，请勿直接暴露到公网</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<div id="modal-root"></div>
+<div id="toasts"></div>
+<script src="static/app.js"></script>
+</body>
+</html>

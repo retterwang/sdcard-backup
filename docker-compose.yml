@@ -1,0 +1,43 @@
+# 存储卡自动备份 —— 绿联 NAS (UGOS Pro) 部署配置
+#
+# 用法：把本项目放到 NAS 的 /volume1/docker/sdcard-backup（经文件管理上传），
+# 修改下方两个路径后：
+#   SSH 方式： cd /volume1/docker/sdcard-backup && docker compose up -d --build
+#   界面方式： Docker 应用 → 项目 → 创建，粘贴本文件（使用已导入的镜像）
+#
+# 首次使用：浏览器打开 http://NAS_IP:8787 ，插入存储卡 → 注册 → 之后插卡全自动增量备份。
+
+services:
+  sdcard-backup:
+    build:
+      context: .
+      # 国内网络无法直连 Docker Hub：基础镜像默认走 DaoCloud 代理；
+      # 海外/有代理时可改为官方 python:3.12-slim-bookworm
+      args:
+        BASE_IMAGE: docker.m.daocloud.io/library/python:3.12-slim-bookworm
+    # 若已导入镜像（方式 B），将上面 6 行 build 配置整段删除
+    image: sdcard-backup:1.0
+    container_name: sdcard-backup
+    privileged: true              # 必需：容器内执行只读挂载（仅挂载权限，程序不写卡）
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=8787
+      - BACKUP_ROOT=/backup       # 备份根目录（照片最终落盘位置）
+      - DATA_DIR=/data            # 索引库与配置（必须持久化，决定增量判断）
+    ports:
+      - "8787:8787"               # 管理界面端口，可改为如 18787:8787
+    volumes:
+      - /dev:/dev                 # 必需：让容器看到外接存储设备
+      - /run/udev:/run/udev:ro    # 必需：让 lsblk 读到宿主 udev 信息（文件系统类型/UUID）；缺失会导致检测退化
+      # 回退：绿联系统已自动挂载存储卡时（UGOS 外接存储默认在 /mnt/@usb 下），
+      # 直接只读读取宿主挂载点；rslave 保证容器启动后新插入的卡也能同步看到。
+      # 若你的 UGOS 外接存储路径不同，按实际路径修改或删除以下 6 行。
+      - type: bind
+        source: /mnt/@usb
+        target: /mnt/@usb
+        read_only: true
+        bind:
+          propagation: rslave
+      - ./data:/data              # 索引库/配置：必须持久化，切勿删除
+      - /volume1/photo/SD卡备份:/backup   # ← 改成你的照片目标文件夹（绿联共享文件夹实际路径）

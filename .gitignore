@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+.local-test/
+*.tar
+*.tar.gz
+*.zip
+.workbuddy/
