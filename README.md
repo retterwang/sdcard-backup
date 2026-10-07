@@ -2,7 +2,7 @@
 
 [English](README.en.md) | **简体中文**
 
-部署在绿联 NAS（UGOS Pro）上的 Docker 程序：**存储卡插入即自动增量备份照片和视频**，
+可以部署在任何一台 NAS 上的 Docker 容器：**存储卡插入即自动增量备份照片和视频**，
 带图形化管理界面查看实时进度与历史任务。只有注册过的卡（白名单）才会触发备份。
 
 ## 功能一览
@@ -29,13 +29,13 @@
 
 详细设计取舍见 [docs/DESIGN.md](docs/DESIGN.md)。
 
-## 部署到绿联 NAS
+## 部署到 NAS
 
 ### 0. 前置条件
 
-- 绿联 NAS 已安装 **Docker** 应用（应用中心 → Docker）
+- NAS 上已安装 **Docker** 应用（各品牌入口略有差异，通常在「应用中心」）
 - 准备照片目标共享文件夹，例如 `/volume1/photo/SD卡备份`
-- 建议在「控制面板 → 终端机」开启 SSH（方式 A 需要）；不开 SSH 可用方式 B
+- 建议开启 SSH（方式 A 需要）；不开 SSH 可用方式 B
 
 ### 1. 部署（三选一）
 
@@ -58,7 +58,7 @@ sudo docker compose up -d --build
 
 1. 在装有 Docker 的电脑上运行 `scripts/build-export.sh`（Windows 用 `build-export.bat`），
    生成 `sdcard-backup-image.tar`
-2. 绿联 Docker 应用 → 镜像 → 导入，上传该 tar
+2. 在 NAS 的 Docker 应用 → 镜像 → 导入，上传该 tar
 3. 编辑 `docker-compose.yml`：**删除 `build: .` 这一行**，其余不变
 4. Docker 应用 → 项目 → 创建，粘贴修改后的 compose 内容，启动
 
@@ -121,11 +121,11 @@ sudo docker compose up -d --build
 | 构建时报 `registry-1.docker.io ... context deadline exceeded` | 内网连不上 Docker Hub。本项目已默认改用国内代理镜像；若仍超时，把 compose 里 `BASE_IMAGE` 换成 Dockerfile 顶部注释中的其他源（1Panel / 华为云），或给 NAS 配置镜像加速器后重试 |
 | 界面打不开 | `sudo docker logs sdcard-backup` 看启动日志；确认端口映射 |
 | 检测不到卡 | 确认 compose 中有 `- /dev:/dev` 与 `privileged: true`；SSH 里执行 `lsblk` 确认宿主能看到设备 |
-| 挂载失败提示 "already mounted" | 绿联系统已自动挂载该卡。方案一：文件管理 → 外部设备 → 安全弹出后再插；方案二：compose 中启用注释掉的 `/mnt/@usb:/mnt/@usb:ro` 映射后重启容器 |
+| 挂载失败提示 "already mounted" | NAS 系统已自动挂载该卡。方案一：在文件管理里安全弹出外部设备后再插；方案二：compose 中启用注释掉的 `/mnt/@usb:/mnt/@usb:ro` 映射后重启容器 |
 | 任务失败"存储卡读取中断" | 卡接触不良或被拔出；重插即可断点续传 |
 | 任务失败"目标存储空间不足" | 清理目标磁盘，或调整 compose 的备份目录 |
 | 拔卡中断会不会丢数据 | 不会。已备份文件在索引里，重插后只补差集 |
-| UGOS 弹出"检测到外部设备" | 可忽略（那是 UGOS 自己的挂载提示） |
+| 系统弹出"检测到外部设备" | 可忽略（那是 NAS 自身的挂载提示） |
 
 ### 7. 运维要点
 

@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.md)
 
-A Docker application for UGREEN NAS (UGOS Pro): **insert a storage card and your photos and videos are backed up automatically and incrementally**, with a web UI for live progress and task history. Only registered cards (whitelist) trigger a backup.
+A Docker container you can deploy on your NAS: **insert a storage card and your photos and videos are backed up automatically and incrementally**, with a web UI for live progress and task history. Only registered cards (whitelist) trigger a backup.
 
 ## Features
 
@@ -28,13 +28,13 @@ Card inserted → detector thread (lsblk scan every 3 s) → whitelist match →
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the detailed design rationale.
 
-## Deploying to a UGREEN NAS
+## Deploying to a NAS
 
 ### 0. Prerequisites
 
-- The **Docker** app is installed on the NAS (App Center → Docker)
+- The **Docker** app is installed on the NAS (the entry point varies by brand, usually the app center)
 - Pick a shared folder as the backup destination, for example `/volume1/photo/sdcard-backup`
-- SSH is recommended for Option A (enable it under Control Panel → Terminal); Option B works without SSH
+- SSH is recommended for Option A; Option B works without SSH
 
 ### 1. Deployment (choose one of three)
 
@@ -57,7 +57,7 @@ sudo docker compose up -d --build
 
 1. On a machine with Docker, run `scripts/build-export.sh` (on Windows use `build-export.bat`) to produce
    `sdcard-backup-image.tar`
-2. In the UGREEN Docker app → Images → Import, upload that tar file
+2. In the NAS Docker app → Images → Import, upload that tar file
 3. Edit `docker-compose.yml`: **delete the `build: .` line**, leave everything else unchanged
 4. Docker app → Project → Create, paste the modified compose content, and start it
 
@@ -124,11 +124,11 @@ finishes or fails. The service type is detected automatically from the URL:
 | Build fails with `registry-1.docker.io ... context deadline exceeded` | The network cannot reach Docker Hub. This project uses domestic mirror proxies by default; if it still times out, switch `BASE_IMAGE` in the compose file to another source listed in the comments at the top of the Dockerfile (1Panel / Huawei Cloud), or configure a registry mirror on the NAS and retry |
 | The UI does not open | Check the startup log with `sudo docker logs sdcard-backup`; verify the port mapping |
 | No card is detected | Confirm the compose file has `- /dev:/dev` and `privileged: true`; run `lsblk` over SSH to confirm the host sees the device |
-| Mount fails with "already mounted" | UGOS has already auto-mounted the card. Option 1: File Manager → External devices → safely eject, then re-insert. Option 2: enable the commented-out `/mnt/@usb:/mnt/@usb:ro` mapping in the compose file and restart the container |
+| Mount fails with "already mounted" | The NAS has already auto-mounted the card. Option 1: safely eject the external device in File Manager, then re-insert. Option 2: enable the commented-out `/mnt/@usb:/mnt/@usb:ro` mapping in the compose file and restart the container |
 | Task fails with "storage card read interrupted" | Poor contact or the card was removed; re-insert it to resume from where it stopped |
 | Task fails with "insufficient destination space" | Free up space on the destination disk, or adjust the backup directory in the compose file |
 | Will removing a card mid-run lose data? | No. Already-copied files are recorded in the index, so only the difference is transferred after re-insertion |
-| UGOS pops up "external device detected" | Safe to ignore — that is UGOS's own mount notification |
+| The system pops up "external device detected" | Safe to ignore — that is the NAS's own mount notification |
 
 ### 7. Operations notes
 
