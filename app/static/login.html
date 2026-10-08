@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0e1013">
+<title>登录 · 存储卡备份控制台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📷</text></svg>">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body class="login-body">
+
+<div class="login-lang">
+  <div class="lang-switch" role="group" aria-label="Language" data-i18n-title="top.lang">
+    <button type="button" class="lang-btn" data-lang="zh">中</button>
+    <button type="button" class="lang-btn" data-lang="en">EN</button>
+  </div>
+</div>
+
+<main class="login-main">
+  <form id="login-form" class="card login-card" autocomplete="on">
+    <div class="login-brand">
+      <span class="logo">📷</span>
+      <div>
+        <h1 data-i18n="app.title">存储卡备份控制台</h1>
+        <p class="sub" data-i18n="auth.signin_hint">请登录后使用</p>
+      </div>
+    </div>
+
+    <label>
+      <span data-i18n="auth.username">用户名</span>
+      <input type="text" id="username" name="username" autocomplete="username"
+             data-i18n-ph="auth.username_ph" placeholder="请输入用户名" autofocus required>
+    </label>
+
+    <label>
+      <span data-i18n="auth.password">密码</span>
+      <input type="password" id="password" name="password" autocomplete="current-password"
+             data-i18n-ph="auth.password_ph" placeholder="请输入密码" required>
+    </label>
+
+    <div id="login-error" class="login-error" role="alert"></div>
+
+    <button class="btn login-btn" type="submit" id="login-submit" data-i18n="auth.signin">登录</button>
+
+    <p class="login-foot" data-i18n="auth.foot_hint">初始账号为 admin / admin，首次登录后会要求修改用户名和密码。</p>
+  </form>
+</main>
+
+<script src="static/i18n.js"></script>
+<script src="static/login.js"></script>
+</body>
+</html>

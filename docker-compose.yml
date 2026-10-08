@@ -5,7 +5,8 @@
 #   SSH 方式： cd /volume1/docker/sdcard-backup && docker compose up -d --build
 #   界面方式： Docker 应用 → 项目 → 创建，粘贴本文件（使用已导入的镜像）
 #
-# 首次使用：浏览器打开 http://NAS_IP:8787 ，插入存储卡 → 注册 → 之后插卡全自动增量备份。
+# 首次使用：浏览器打开 http://NAS_IP:8787 → 用初始账号 admin / admin 登录
+#          （登录后要求先设置自己的用户名和密码）→ 插入存储卡 → 注册 → 之后插卡全自动增量备份。
 
 services:
   sdcard-backup:
@@ -25,6 +26,10 @@ services:
       - PORT=8787
       - BACKUP_ROOT=/backup       # 备份根目录（照片最终落盘位置）
       - DATA_DIR=/data            # 索引库与配置（必须持久化，决定增量判断）
+      # 可选：初始管理员账号（仅首次启动、且 users 表为空时创建；登录后强制修改）
+      # - INITIAL_ADMIN_USER=admin
+      # - INITIAL_ADMIN_PASSWORD=admin
+      # - SESSION_TTL=604800      # 登录会话有效期（秒），默认 7 天
     ports:
       - "8787:8787"               # 管理界面端口，可改为如 18787:8787
     volumes:

@@ -17,6 +17,7 @@ A Docker container you can deploy on your NAS: **insert a storage card and your 
 | Folder organization | Organize by capture date (2024/01/15/…) or keep the card's original structure — configurable per card |
 | Completion notifications | Webhook auto-detects PushPlus / WeCom (WeChat Work) group bot / ServerChan / DingTalk; notification language (Chinese or English) is configurable |
 | Bilingual UI | Switch Chinese / English from the top bar; interface text and task results follow instantly, and the choice is remembered in the browser |
+| Sign-in & accounts | Username/password sign-in with an HttpOnly session cookie. The initial administrator `admin` / `admin` must change its username and password on first sign-in; administrators can create, disable, delete accounts and reset passwords |
 | Mobile friendly | Adaptive layout for desktop, tablet and phone — check progress, register cards and change settings from a phone |
 | Resume & retry | One-click retry for failed tasks; the destination free-space check aborts early when there is not enough room |
 
@@ -72,7 +73,8 @@ If the image is already on the NAS (imported via Option B), simply paste the com
 
 ### 2. First-time setup (one-off)
 
-1. Open `http://<NAS-IP>:8787` in a browser
+1. Open `http://<NAS-IP>:8787` in a browser and sign in with the initial account `admin` / `admin`
+   (the console then asks you to set your own username and password — see section 9)
 2. Insert a storage card (a USB card reader or the NAS's built-in slot both work)
 3. The overview page shows "Unregistered storage card detected" → click **Register and enable this card**,
    fill in an alias (for example "Canon-R6"), choose the organization mode → Save (the first backup starts immediately)
@@ -151,12 +153,43 @@ Switching only changes wording; **backup behaviour is unaffected**.
 - Upgrade: update the code, then `sudo docker compose up -d --build`
 - Backup strategy advice: a copy on the NAS is not a final backup. Keep an off-site copy of important photos
 
-### 9. Security notes
+### 9. Accounts and sign-in
+
+The console is protected by a username/password login, so one account per person is possible.
+
+- On first start the program creates an administrator **`admin` / `admin`** and forces you to change the
+  username and password immediately after that first sign-in. Until you do, every other request is
+  rejected and the console shows only that form.
+- Accounts created by an administrator — and accounts whose password was reset — must personalise their
+  username and password on their next sign-in as well.
+- Passwords are stored as PBKDF2-HMAC-SHA256 (200,000 iterations + random salt) inside the local SQLite
+  file; nothing is kept in plain text.
+- Sessions live in an HttpOnly cookie, are valid for 7 days and are renewed while in use. Changing the
+  credentials invalidates every existing session of that account.
+- Repeated failures from the same address are throttled (8 attempts / 5 minutes).
+- The **Users** tab is shown to administrators only: create accounts, reset passwords, enable/disable,
+  delete. The account you are signed in with cannot be deleted or disabled, and the last enabled
+  administrator cannot be demoted or removed.
+
+Optional environment variables (`docker-compose.yml`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `INITIAL_ADMIN_USER` | `admin` | Username of the auto-created first administrator |
+| `INITIAL_ADMIN_PASSWORD` | `admin` | Password of the auto-created first administrator |
+| `SESSION_TTL` | `604800` (7 days) | Sign-in session lifetime, in seconds |
+
+> Lost the administrator password? Remove every row from the `users` table in `/data/app.db` and restart
+> the container — the default account is created again (the card index and task history are untouched).
+
+### 10. Security notes
 
 - The container requires `privileged: true`, used only to perform read-only `mount`/`umount` and read device information.
   The program never writes to the card and never deletes the source
 - The management UI is intended for **LAN use only**. Do not expose the port to the public internet; if remote access
   is required, put it behind a reverse proxy with authentication
+- Change the initial `admin` / `admin` credentials on first sign-in, and give every person their own account
+  instead of sharing one
 
 ## Local development and testing
 
@@ -166,21 +199,25 @@ pip install -r requirements.txt  # Required to run locally
 python -m app                    # Full experience on Linux (Windows has no lsblk, so device detection is paused)
 ```
 
+Open http://localhost:8787 and sign in with `admin` / `admin`; the console then asks you to set your own
+username and password before anything else.
+
 ## Project structure
 
 ```
 ├── app/
 │   ├── config.py      # Environment configuration and default settings
-│   ├── db.py          # SQLite: whitelist / file index / tasks / settings
+│   ├── db.py          # SQLite: whitelist / file index / tasks / settings / users / sessions
+│   ├── auth.py        # Accounts, sign-in sessions and password hashing (PBKDF2)
 │   ├── detector.py    # Device detection (lsblk polling) and card identity resolution
 │   ├── mounter.py     # Read-only mounting and fallback strategies
 │   ├── backup.py      # Incremental backup engine (planning / copying / verification)
 │   ├── runner.py      # Task queue, state machine, notifications
 │   ├── i18n.py        # Chinese/English message tables (backend messages, task results, notifications)
 │   ├── notify.py      # Notification channel adapters (PushPlus / mail / SMTP / WeCom / DingTalk / ServerChan)
-│   ├── web.py         # FastAPI REST + SSE
+│   ├── web.py         # FastAPI REST + SSE + sign-in gate
 │   ├── __main__.py    # Entry point
-│   └── static/        # Web UI (index.html / i18n.js / app.js / style.css)
+│   └── static/        # Web UI (index.html / login.html / i18n.js / app.js / style.css)
 ├── tests/test_core.py # Core logic tests
 ├── scripts/           # Build and export scripts
 ├── Dockerfile

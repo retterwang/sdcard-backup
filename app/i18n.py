@@ -178,6 +178,74 @@ MESSAGES: dict = {
         "en": ("Incomplete SMTP URL (expected sender:password@SMTP-host:port; encode @ # : in the "
                "password as %40 %23 %3A)"),
     },
+
+    # ── 登录与账号 ──
+    "auth.err.login_required": {"zh": "请先登录", "en": "Please sign in first"},
+    "auth.err.must_change": {
+        "zh": "首次登录需先修改用户名和密码",
+        "en": "Change your username and password before using the console",
+    },
+    "auth.err.admin_only": {"zh": "需要管理员权限", "en": "Administrator privileges required"},
+    "auth.err.bad_credentials": {"zh": "用户名或密码错误", "en": "Incorrect username or password"},
+    "auth.err.disabled": {
+        "zh": "该账号已停用，请联系管理员",
+        "en": "This account is disabled; contact an administrator",
+    },
+    "auth.err.too_many": {
+        "zh": "登录失败次数过多，请约 {minutes} 分钟后重试",
+        "en": "Too many failed attempts; try again in about {minutes} minute(s)",
+    },
+    "auth.err.user_not_found": {"zh": "用户不存在", "en": "User not found"},
+    "auth.err.username_len": {
+        "zh": "用户名长度需为 {min}-{max} 个字符",
+        "en": "Username must be {min}-{max} characters long",
+    },
+    "auth.err.username_chars": {
+        "zh": "用户名只能包含字母、数字、汉字、下划线、点、@ 和连字符",
+        "en": "Username may only contain letters, digits, CJK characters, _ . @ and -",
+    },
+    "auth.err.username_taken": {"zh": "该用户名已被占用", "en": "That username is already taken"},
+    "auth.err.password_len": {
+        "zh": "密码长度至少 {min} 位",
+        "en": "Password must be at least {min} characters",
+    },
+    "auth.err.password_same": {
+        "zh": "密码不能与用户名相同",
+        "en": "The password cannot be the same as the username",
+    },
+    "auth.err.password_unchanged": {
+        "zh": "新密码不能与当前密码相同",
+        "en": "The new password must differ from the current one",
+    },
+    "auth.err.passwords_mismatch": {
+        "zh": "两次输入的密码不一致",
+        "en": "The two passwords do not match",
+    },
+    "auth.err.current_wrong": {"zh": "当前密码不正确", "en": "Current password is incorrect"},
+    "auth.err.need_new_username": {
+        "zh": "请设置一个新的用户名（不能与当前的相同）",
+        "en": "Please set a new username (it must differ from the current one)",
+    },
+    "auth.err.nothing_changed": {"zh": "没有需要修改的内容", "en": "Nothing to update"},
+    "auth.err.self_delete": {
+        "zh": "不能删除当前登录的账号",
+        "en": "You cannot delete the account you are signed in with",
+    },
+    "auth.err.self_disable": {
+        "zh": "不能停用当前登录的账号",
+        "en": "You cannot disable the account you are signed in with",
+    },
+    "auth.err.last_admin": {
+        "zh": "至少需要保留一个启用状态的管理员账号",
+        "en": "At least one enabled administrator must remain",
+    },
+
+    "web.login_ok": {"zh": "登录成功", "en": "Signed in"},
+    "web.logout_ok": {"zh": "已退出登录", "en": "Signed out"},
+    "web.credentials_changed": {"zh": "账号信息已更新", "en": "Account updated"},
+    "web.user_created": {"zh": "用户已创建", "en": "User created"},
+    "web.user_updated": {"zh": "用户已更新", "en": "User updated"},
+    "web.user_deleted": {"zh": "用户已删除", "en": "User deleted"},
 }
 
 # 兼容旧调用：无别名键

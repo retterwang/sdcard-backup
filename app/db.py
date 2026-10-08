@@ -1,10 +1,11 @@
 """SQLite 存储层。
 
-四类数据：
+五类数据：
 - cards     卡片白名单（按卡的身份 ID 匹配，只有注册过的卡才自动备份）
 - files     文件索引（增量备份的核心依据：路径 + 大小 + mtime + 哈希）
 - tasks     备份任务与结果
 - settings  业务设置（键值对，界面可改）
+- users/sessions  账号与登录会话（密码摘要 + 会话 token）
 """
 from __future__ import annotations
 
@@ -77,8 +78,28 @@ CREATE TABLE IF NOT EXISTS settings (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY COLLATE NOCASE,
+    pass_hash TEXT NOT NULL,
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    must_change INTEGER NOT NULL DEFAULT 0,
+    created_at REAL,
+    last_login_at REAL,
+    last_login_ip TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at REAL,
+    expires_at REAL,
+    ip TEXT DEFAULT '',
+    ua TEXT DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_files_card ON files(card_id);
 CREATE INDEX IF NOT EXISTS idx_errors_task ON task_errors(task_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);
+CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 """
 
 # PATCH 接口允许修改的卡片字段
@@ -130,6 +151,15 @@ class DB:
     def query_one(self, sql, args=()):
         r = self._conn().execute(sql, args).fetchone()
         return dict(r) if r else None
+
+    def close(self):
+        """关闭当前线程持有的连接（测试或进程退出时使用）。"""
+        c = getattr(self._local, "conn", None)
+        if c is not None:
+            try:
+                c.close()
+            finally:
+                self._local.conn = None
 
     # ── 设置 ──────────────────────────────────────────────
     def settings_all(self) -> dict:
@@ -311,3 +341,83 @@ class DB:
                 c.execute("DELETE FROM task_errors WHERE task_id < ?", (r["m"],))
                 c.execute("DELETE FROM tasks WHERE id < ?", (r["m"],))
                 c.commit()
+
+    # ── 用户 ──────────────────────────────────────────────
+    def users_all(self) -> list:
+        return self.query("SELECT * FROM users ORDER BY created_at, username")
+
+    def users_count(self) -> int:
+        r = self.query_one("SELECT COUNT(*) n FROM users")
+        return int(r["n"]) if r else 0
+
+    def admins_enabled(self) -> int:
+        r = self.query_one("SELECT COUNT(*) n FROM users WHERE is_admin=1 AND enabled=1")
+        return int(r["n"]) if r else 0
+
+    def user_get(self, username: str):
+        return self.query_one("SELECT * FROM users WHERE username=?", (username or "",))
+
+    def user_create(self, username: str, pass_hash: str, is_admin: bool = False,
+                    must_change: bool = False) -> dict:
+        self.execute(
+            "INSERT INTO users(username,pass_hash,is_admin,enabled,must_change,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (username, pass_hash, 1 if is_admin else 0, 1, 1 if must_change else 0, time.time()),
+        )
+        return self.user_get(username)
+
+    # 允许修改的用户字段（其余字段由 auth.py 之外的地方禁止触碰）
+    USER_PATCHABLE = {"username", "pass_hash", "is_admin", "enabled",
+                      "must_change", "last_login_at", "last_login_ip"}
+
+    def user_update(self, username: str, patch: dict) -> dict:
+        fields, args = [], []
+        for k, v in patch.items():
+            if k not in self.USER_PATCHABLE:
+                continue
+            if k in ("is_admin", "enabled", "must_change"):
+                v = 1 if v else 0
+            fields.append(f"{k}=?")
+            args.append(v)
+        if not fields:
+            return self.user_get(username)
+        args.append(username)
+        with self._lock:
+            c = self._conn()
+            c.execute(f"UPDATE users SET {', '.join(fields)} WHERE username=?", args)
+            if "username" in patch:      # 改名后同步会话归属，避免旧会话丢失身份
+                c.execute("UPDATE sessions SET username=? WHERE username=?",
+                          (patch["username"], username))
+            c.commit()
+        return self.user_get(patch.get("username", username))
+
+    def user_delete(self, username: str):
+        with self._lock:
+            c = self._conn()
+            c.execute("DELETE FROM sessions WHERE username=?", (username,))
+            c.execute("DELETE FROM users WHERE username=?", (username,))
+            c.commit()
+
+    # ── 会话 ──────────────────────────────────────────────
+    def session_create(self, token: str, username: str, created_at: float,
+                       expires_at: float, ip: str = "", ua: str = ""):
+        self.execute(
+            "INSERT INTO sessions(token,username,created_at,expires_at,ip,ua) "
+            "VALUES(?,?,?,?,?,?)",
+            (token, username, created_at, expires_at, ip, ua),
+        )
+
+    def session_get(self, token: str):
+        return self.query_one("SELECT * FROM sessions WHERE token=?", (token or "",))
+
+    def session_touch(self, token: str, expires_at: float):
+        self.execute("UPDATE sessions SET expires_at=? WHERE token=?", (expires_at, token))
+
+    def session_delete(self, token: str):
+        self.execute("DELETE FROM sessions WHERE token=?", (token or "",))
+
+    def sessions_delete_user(self, username: str):
+        self.execute("DELETE FROM sessions WHERE username=?", (username,))
+
+    def sessions_purge(self, now: float = None):
+        self.execute("DELETE FROM sessions WHERE expires_at < ?", (now or time.time(),))

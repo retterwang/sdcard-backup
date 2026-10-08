@@ -7,6 +7,8 @@ const $ = (s, el) => (el || document).querySelector(s);
 
 let SNAP = null;
 let ES = null;
+let ME = null;              // 当前登录用户
+let USERS = [];             // 用户列表（仅管理员加载）
 let settingsDirty = false;
 let prevCurrentTaskId = null;
 let connOk = null;
@@ -50,9 +52,18 @@ function fmtEta(s) {
 async function api(path, opts = {}) {
   const url = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'lang=' + getLang();
   const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (r.status === 401) {                       // 会话失效 → 回到登录页
+    location.replace('/login');
+    throw new Error(T('auth.err.login_required'));
+  }
   let data = {};
   try { data = await r.json(); } catch (e) { /* 空响应 */ }
-  if (!r.ok) throw new Error((data && data.detail) || T('toast.request_failed', { status: r.status }));
+  if (!r.ok) {
+    if (r.status === 403 && data && data.detail === T('auth.err.must_change')) {
+      location.reload();                        // 首次登录未改密 → 刷新后弹出强制修改
+    }
+    throw new Error((data && data.detail) || T('toast.request_failed', { status: r.status }));
+  }
   return data;
 }
 
@@ -355,6 +366,144 @@ function renderSettings() {
   if (nl) nl.value = s.notify_lang === 'en' ? 'en' : 'zh';
 }
 
+/* ────────────────────────── 账号与用户 ────────────────────────── */
+async function boot() {
+  try {
+    const r = await fetch('/api/auth/me?lang=' + getLang());
+    if (r.status === 401) { location.replace('/login'); return; }
+    const d = await r.json();
+    ME = d.user || null;
+  } catch (e) { /* 后端未就绪：仍按未登录渲染 */ }
+  renderUser();
+  if (ME && ME.must_change) { showGate(); return; }   // 首次登录：先改用户名和密码
+  if (ME && ME.is_admin && localStorage.getItem('sdbak.tab') === 'users') loadUsers();
+  connect();
+}
+
+function renderUser() {
+  const nameEl = $('#user-name');
+  if (nameEl) nameEl.textContent = ME ? ME.username : T('auth.anonymous');
+  const chip = $('#user-chip');
+  if (chip) {
+    chip.title = ME ? (ME.is_admin ? T('role.admin') : T('role.member')) : '';
+    chip.classList.toggle('admin', !!(ME && ME.is_admin));
+  }
+  const tabBtn = $('#tab-users-btn');
+  if (tabBtn) tabBtn.textContent = T(ME && ME.is_admin ? 'tab.users' : 'tab.account');
+  const adminCard = $('#users-admin-card');
+  if (adminCard) adminCard.hidden = !(ME && ME.is_admin);
+  const uname = $('#a-username');
+  if (uname && ME) uname.placeholder = ME.username;
+}
+
+function showGate() {
+  const g = $('#gate');
+  if (!g) return;
+  g.hidden = false;
+  if (ME) {
+    const u = $('#g-username');
+    if (u) { u.value = ''; u.placeholder = ME.username; }
+  }
+  const c = $('#g-current');
+  if (c) c.focus();
+}
+
+async function loadUsers() {
+  if (!ME || !ME.is_admin) return;
+  try {
+    const d = await api('/api/users');
+    USERS = d.users || [];
+    renderUsersTable();
+  } catch (e) {
+    toast(e.message || String(e), 'err');
+  }
+}
+
+function userRow(u) {
+  const isMe = ME && u.username === ME.username;
+  const state = u.enabled
+    ? `<span class="chip ok">${esc(T('chip.active'))}</span>`
+    : `<span class="chip warn">${esc(T('chip.disabled'))}</span>`;
+  return `
+    <tr>
+      <td>${esc(u.username)}${isMe ? ` <span class="chip muted">${esc(T('chip.you'))}</span>` : ''}</td>
+      <td>${esc(T(u.is_admin ? 'role.admin' : 'role.member'))}</td>
+      <td>${state}${u.must_change ? ` <span class="chip muted">${esc(T('chip.must_change'))}</span>` : ''}</td>
+      <td>${fmtTime(u.created_at)}</td>
+      <td>${fmtTime(u.last_login_at)}</td>
+      <td><div class="row-actions">
+        <button class="btn sm ghost" data-action="reset-pw" data-id="${esc(u.username)}">${esc(T('users.reset_pw'))}</button>
+        <button class="btn sm ghost" data-action="toggle-user" data-id="${esc(u.username)}" ${isMe ? 'disabled' : ''}>${esc(T(u.enabled ? 'btn.disable' : 'btn.enable'))}</button>
+        <button class="btn sm danger" data-action="del-user" data-id="${esc(u.username)}" ${isMe ? 'disabled' : ''}>${esc(T('btn.delete'))}</button>
+      </div></td>
+    </tr>`;
+}
+
+function renderUsersTable() {
+  const el = $('#users-table');
+  if (!el) return;
+  if (!USERS.length) { el.innerHTML = `<div class="empty">—</div>`; return; }
+  el.innerHTML = `
+    <div class="table-wrap"><table><thead><tr>
+      <th>${esc(T('th.username'))}</th><th>${esc(T('th.role'))}</th><th>${esc(T('th.userstatus'))}</th>
+      <th>${esc(T('th.created'))}</th><th>${esc(T('th.last_login'))}</th><th>${esc(T('th.ops'))}</th>
+    </tr></thead><tbody>${USERS.map(userRow).join('')}</tbody></table></div>`;
+}
+
+function openUserModal() {
+  openModal(`
+    <h3>${esc(T('modal.new_user'))}</h3>
+    <div class="form-grid">
+      <label>
+        <span>${esc(T('modal.username'))}</span>
+        <input type="text" id="u-name" autocomplete="off">
+        <small>${esc(T('acct.username_hint'))}</small>
+      </label>
+      <label>
+        <span>${esc(T('modal.password'))}</span>
+        <input type="password" id="u-pass" autocomplete="new-password">
+        <small>${esc(T('acct.password_hint'))}</small>
+      </label>
+      <label>
+        <span>${esc(T('modal.confirm_password'))}</span>
+        <input type="password" id="u-pass2" autocomplete="new-password">
+      </label>
+      <label class="switch-line">
+        <span>${esc(T('modal.admin'))}</span>
+        <span class="switch"><input type="checkbox" id="u-admin"><i></i></span>
+      </label>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-action="modal-close">${esc(T('modal.cancel'))}</button>
+      <button class="btn" data-action="user-save">${esc(T('modal.save'))}</button>
+    </div>`);
+  const f = $('#u-name');
+  if (f) f.focus();
+}
+
+function openResetModal(name) {
+  openModal(`
+    <h3>${esc(T('modal.reset_pw', { name }))}</h3>
+    <p class="hint">${esc(T('modal.reset_pw_hint'))}</p>
+    <div class="form-grid">
+      <label>
+        <span>${esc(T('modal.password'))}</span>
+        <input type="password" id="u-pass" autocomplete="new-password">
+        <small>${esc(T('acct.password_hint'))}</small>
+      </label>
+      <label>
+        <span>${esc(T('modal.confirm_password'))}</span>
+        <input type="password" id="u-pass2" autocomplete="new-password">
+      </label>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-action="modal-close">${esc(T('modal.cancel'))}</button>
+      <button class="btn" data-action="user-pw-save" data-id="${esc(name)}">${esc(T('modal.save'))}</button>
+    </div>`);
+  const f = $('#u-pass');
+  if (f) f.focus();
+}
+
 /* ────────────────────────── 弹窗 ────────────────────────── */
 function openModal(html) {
   $('#modal-root').innerHTML = `<div class="overlay"><div class="modal">${html}</div></div>`;
@@ -490,6 +639,50 @@ document.addEventListener('click', async e => {
     } else if (action === 'eject-card') {
       const r = await api('/api/cards/' + encodeURIComponent(id) + '/unmount', { method: 'POST' });
       toast(r.message, 'info');
+    } else if (action === 'logout') {
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch (err) { /* 已失效也照样退出 */ }
+      location.replace('/login');
+    } else if (action === 'account') {
+      switchTab('users');
+    } else if (action === 'new-user') {
+      openUserModal();
+    } else if (action === 'reset-pw') {
+      openResetModal(id);
+    } else if (action === 'user-save') {
+      const username = $('#u-name').value.trim();
+      const pw = $('#u-pass').value, pw2 = $('#u-pass2').value;
+      if (!username) { toast(T('auth.err.username_required'), 'err'); return; }
+      if (pw !== pw2) { toast(T('auth.err.passwords_mismatch'), 'err'); return; }
+      const r = await api('/api/users', {
+        method: 'POST',
+        body: JSON.stringify({ username: username, password: pw, is_admin: $('#u-admin').checked }),
+      });
+      toast(r.message || T('toast.user_created'));
+      closeModal();
+      await loadUsers();
+    } else if (action === 'user-pw-save') {
+      const pw = $('#u-pass').value, pw2 = $('#u-pass2').value;
+      if (pw !== pw2) { toast(T('auth.err.passwords_mismatch'), 'err'); return; }
+      await api('/api/users/' + encodeURIComponent(btn.dataset.id), {
+        method: 'PATCH', body: JSON.stringify({ password: pw }),
+      });
+      toast(T('toast.pw_reset'), 'info');
+      closeModal();
+      await loadUsers();
+    } else if (action === 'toggle-user') {
+      const u = USERS.find(x => x.username === id);
+      if (!u) return;
+      if (u.enabled && !confirm(T('confirm.disable_user', { name: id }))) return;
+      const r = await api('/api/users/' + encodeURIComponent(id), {
+        method: 'PATCH', body: JSON.stringify({ enabled: !u.enabled }),
+      });
+      toast(r.message || T('toast.user_updated'));
+      await loadUsers();
+    } else if (action === 'del-user') {
+      if (!confirm(T('confirm.delete_user', { name: id }))) return;
+      const r = await api('/api/users/' + encodeURIComponent(id), { method: 'DELETE' });
+      toast(r.message || T('toast.user_deleted'), 'info');
+      await loadUsers();
     }
   } catch (err) {
     toast(err.message || String(err), 'err');
@@ -507,6 +700,8 @@ function updateLangButtons() {
 window.onLangChanged = () => {
   updateLangButtons();
   renderConn();
+  renderUser();
+  if (ME && ME.is_admin) renderUsersTable();
   if (SNAP) render();
   const st = $('#settings-status');
   if (st && st.dataset.state === 'dirty') st.textContent = T('set.dirty');
@@ -553,11 +748,71 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   switchTab(localStorage.getItem('sdbak.tab') || 'dash');
 
-  connect();
+  // 修改自己的账号信息
+  const acct = $('#account-form');
+  acct.addEventListener('submit', async e => {
+    e.preventDefault();
+    const cur = $('#a-current').value;
+    const newUser = $('#a-username').value.trim();
+    const newPw = $('#a-password').value;
+    const confirmPw = $('#a-confirm').value;
+    const st = $('#account-status');
+    if (newPw && newPw !== confirmPw) { toast(T('auth.err.passwords_mismatch'), 'err'); return; }
+    if (!newPw && (!newUser || newUser === (ME && ME.username))) {
+      toast(T('auth.err.nothing_changed'), 'err');
+      return;
+    }
+    const body = { current_password: cur };
+    if (newUser) body.new_username = newUser;
+    if (newPw) { body.new_password = newPw; body.confirm_password = confirmPw; }
+    try {
+      const r = await api('/api/auth/change-credentials', { method: 'POST', body: JSON.stringify(body) });
+      st.textContent = T('acct.saved');
+      toast(r.message || T('acct.saved'));
+      setTimeout(() => location.reload(), 800);   // 会话已轮换，重新加载更稳妥
+    } catch (err) {
+      st.textContent = '';
+      toast(err.message || String(err), 'err');
+    }
+  });
+
+  // 首次登录：强制修改用户名和密码
+  const gate = $('#gate-form');
+  gate.addEventListener('submit', async e => {
+    e.preventDefault();
+    const st = $('#gate-status');
+    const btn = $('#gate-form button[type=submit]');
+    const pw = $('#g-password').value, pw2 = $('#g-confirm').value;
+    const newName = $('#g-username').value.trim();
+    st.textContent = '';
+    if (!newName) { st.textContent = T('auth.err.username_required'); return; }
+    if (ME && newName === ME.username) { st.textContent = T('auth.err.need_new_username'); return; }
+    if (pw !== pw2) { st.textContent = T('auth.err.passwords_mismatch'); return; }
+    btn.disabled = true;
+    try {
+      await api('/api/auth/change-credentials', {
+        method: 'POST',
+        body: JSON.stringify({
+          current_password: $('#g-current').value,
+          new_username: newName,
+          new_password: pw,
+          confirm_password: pw2,
+        }),
+      });
+      toast(T('acct.saved'));
+      setTimeout(() => location.reload(), 600);
+    } catch (err) {
+      st.textContent = err.message || String(err);
+      btn.disabled = false;
+    }
+  });
+
+  boot();
 });
 
 function switchTab(t) {
   localStorage.setItem('sdbak.tab', t);
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   document.querySelectorAll('.tabpane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + t));
+  if (t === 'users' && ME && ME.is_admin) loadUsers();
 }

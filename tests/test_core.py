@@ -145,7 +145,7 @@ def test_detector():
     devs6 = detector.build_devices(sample_emmc, sysfs=_sd_sysfs,
                                    probe=lambda n, s=0: {}, realpath=lambda p: "")
     ok(len(devs6) == 1, f"device/type=SD 的 mmcblk 应可识别: {devs6}")
-    print("  [1/7] 设备解析与卡片识别  ✓")
+    print("  [1/8] 设备解析与卡片识别  ✓")
 
 
 def test_media():
@@ -171,7 +171,7 @@ def test_media():
     ok(media.is_media("a.JPG") and media.is_media("b.insv") and not media.is_media("readme.txt"),
        "媒体类型识别异常")
     ok(media.is_junk("MVI_0001.THM") and not media.is_junk("MVI_0001.MP4"), "垃圾伴随文件识别异常")
-    print("  [2/7] 日期推断与媒体识别  ✓")
+    print("  [2/8] 日期推断与媒体识别  ✓")
 
 
 def test_path_safety():
@@ -184,7 +184,7 @@ def test_path_safety():
        "分隔符未清洗")
     ok(media.slug_subdir("") == "card", "空别名应回退 card")
     ok(media.fmt_bytes(1536) == "1.5 KB", f"fmt_bytes 异常: {media.fmt_bytes(1536)}")
-    print("  [3/7] 路径安全与格式化  ✓")
+    print("  [3/8] 路径安全与格式化  ✓")
 
 
 def test_plan():
@@ -219,7 +219,7 @@ def test_plan():
     card4 = dict(card, exclude_globs="*.MP4")
     items4, _, _, _ = backup.build_plan(files, index, card4)
     ok(all(not x.rel.endswith(".MP4") for x in items4), "exclude 规则过滤异常")
-    print("  [4/7] 增量计划与过滤规则  ✓")
+    print("  [4/8] 增量计划与过滤规则  ✓")
 
 
 def test_copy():
@@ -273,7 +273,7 @@ def test_copy():
             ok(False, "错误哈希未被检出")
         except OSError:
             ok(True, "")
-    print("  [5/7] 复制、冲突与校验  ✓")
+    print("  [5/8] 复制、冲突与校验  ✓")
 
 
 def test_notify():
@@ -350,7 +350,7 @@ def test_notify():
     # 通用回退：JSON {title, text}
     _, data, _, _ = notify.build_request("https://example.com/hook", "标题", "内容")
     ok(json.loads(data.decode("utf-8")) == {"title": "标题", "text": "内容"}, "通用载荷异常")
-    print("  [6/7] 通知载荷适配  ✓")
+    print("  [6/8] 通知载荷适配  ✓")
 
 
 def test_i18n():
@@ -388,7 +388,136 @@ def test_i18n():
     ok(i18n.render_stored("新增 2 个（1.0 MB）", "en") == "新增 2 个（1.0 MB）",
        "历史纯文本应原样返回")
     ok(i18n.render_stored("", "en") == "", "空消息渲染异常")
-    print("  [7/7] 界面语言与消息渲染  ✓")
+    print("  [7/8] 界面语言与消息渲染  ✓")
+
+
+def test_auth():
+    """账号与权限：初始管理员、密码哈希、登录、强制改密、用户管理与登录限速。"""
+    from app import auth, i18n
+    from app.db import DB
+
+    TEST_IP = "127.0.0.1"   # 登录来源 IP（限速与审计字段用，白名单地址避免误报）
+
+    with tempfile.TemporaryDirectory() as td:
+        db = DB(os.path.join(td, "auth.db"))
+
+        # ── 初始管理员：库内无用户时创建，且强制修改用户名与密码 ──
+        auth.ensure_default_admin(db)
+        u = db.user_get("admin")
+        ok(u is not None and u["is_admin"] == 1 and u["enabled"] == 1 and u["must_change"] == 1,
+           "初始管理员创建异常")
+        auth.ensure_default_admin(db)
+        ok(db.users_count() == 1, "重复初始化不应重复建号")
+
+        # ── 密码哈希：随机盐、常量时间校验、异常存储格式一律不通过 ──
+        ok(auth.hash_password("abc") != auth.hash_password("abc"), "盐应随机")
+        ok(auth.verify_password("abc", auth.hash_password("abc", "deadbeef")),
+           "注入盐的校验异常")
+        ok(not auth.verify_password("abd", auth.hash_password("abc")), "错误密码不应通过")
+        ok(not auth.verify_password("abc", "garbage"), "异常存储格式应视为不通过")
+        ok("$" in auth.hash_password("abc") and auth.hash_password("abc").count("$") == 3,
+           "哈希格式应含算法/迭代/盐/摘要四段")
+
+        # ── 登录 ──
+        r = auth.login(db, "admin", "wrong", TEST_IP)
+        ok(not r["ok"] and r["key"] == "auth.err.bad_credentials", f"错误密码应拒绝: {r}")
+        r = auth.login(db, "admin", "admin", TEST_IP)
+        ok(r["ok"] and r["token"] and r["user"]["must_change"], f"初始登录应成功: {r}")
+        ok("pass_hash" not in r["user"], "对外视图不应包含密码摘要")
+        token = r["token"]
+        ok(auth.current_user(db, token)["username"] == "admin", "会话应可解析")
+        ok(auth.current_user(db, "bogus") is None, "伪造 token 应无效")
+        ok(db.user_get("admin")["last_login_at"] is not None, "应记录最近登录时间")
+
+        # ── 强制改密（首次登录必须换用户名 + 换密码） ──
+        r = auth.change_credentials(db, "admin", "admin", "admin", "newpass123", "newpass123",
+                                    require_new_username=True)
+        ok(not r["ok"] and r["key"] == "auth.err.need_new_username", f"应要求更换用户名: {r}")
+        r = auth.change_credentials(db, "admin", "bad", "alice", "newpass123", "newpass123", True)
+        ok(not r["ok"] and r["key"] == "auth.err.current_wrong", f"当前密码校验异常: {r}")
+        r = auth.change_credentials(db, "admin", "admin", "alice", "newpass123", "other123", True)
+        ok(not r["ok"] and r["key"] == "auth.err.passwords_mismatch", f"确认密码校验异常: {r}")
+        r = auth.change_credentials(db, "admin", "admin", "alice", "short", "short", True)
+        ok(not r["ok"] and r["key"] == "auth.err.password_len", f"弱密码应拒绝: {r}")
+        r = auth.change_credentials(db, "admin", "admin", "alice", "admin", "admin", True)
+        ok(not r["ok"] and r["key"] in
+           ("auth.err.password_len", "auth.err.password_same", "auth.err.password_unchanged"),
+           f"沿用旧密码应拒绝: {r}")
+
+        r = auth.change_credentials(db, "admin", "admin", "alice", "newpass123", "newpass123", True)
+        ok(r["ok"] and r["user"]["username"] == "alice" and not r["user"]["must_change"],
+           f"改密失败: {r}")
+        ok(db.user_get("admin") is None and db.user_get("alice") is not None, "用户名应已更新")
+        ok(auth.verify_password("newpass123", db.user_get("alice")["pass_hash"])
+           and not auth.verify_password("admin", db.user_get("alice")["pass_hash"]),
+           "密码应已替换")
+        ok(auth.current_user(db, token) is None, "改密后旧会话应失效")
+        ok(auth.current_user(db, r["token"])["username"] == "alice", "新会话应有效")
+
+        # ── 用户管理：校验、重名、自我与末位管理员保护 ──
+        ok(auth.create_user(db, "guest", "guest123")["ok"], "应可创建普通用户")
+        ok(auth.create_user(db, "guest", "guest123")["key"] == "auth.err.username_taken",
+           "重名应拒绝")
+        ok(auth.create_user(db, "GUEST", "guest123")["key"] == "auth.err.username_taken",
+           "用户名应大小写不敏感")
+        ok(auth.create_user(db, "x", "guest123")["key"] == "auth.err.username_len",
+           "用户名过短应拒绝")
+        ok(auth.create_user(db, "bad name", "guest123")["key"] == "auth.err.username_chars",
+           "非法字符应拒绝")
+        ok(auth.create_user(db, "guest2", "abc")["key"] == "auth.err.password_len",
+           "弱密码应拒绝")
+        ok(auth.create_user(db, "guest2", "guest2")["key"] == "auth.err.password_same",
+           "密码与用户名相同应拒绝")
+        ok(auth.create_user(db, "guest2", "guest234")["user"]["must_change"] == 1,
+           "新用户应标记为需首次修改")
+
+        ok(auth.delete_user(db, "alice", "alice")["key"] == "auth.err.self_delete",
+           "不应允许删除当前登录账号")
+        ok(auth.update_user(db, "alice", "alice", {"enabled": False})["key"]
+           == "auth.err.self_disable", "不应允许停用当前登录账号")
+        ok(auth.update_user(db, "alice", "alice", {"is_admin": False})["key"]
+           == "auth.err.last_admin", "最后一名管理员不可降级")
+        ok(auth.delete_user(db, "guest", "alice")["key"] == "auth.err.last_admin",
+           "最后一名管理员不可删除")
+        ok(auth.update_user(db, "alice", "nobody", {"enabled": False})["key"]
+           == "auth.err.user_not_found", "未知用户应报错")
+
+        # ── 重置密码：旧会话立即失效，且需重新设置账号信息 ──
+        gtoken = auth.login(db, "guest", "guest123", TEST_IP)["token"]
+        r = auth.update_user(db, "alice", "guest", {"password": "reset1234"})
+        ok(r["ok"] and r["user"]["must_change"] == 1, f"重置密码异常: {r}")
+        ok(auth.current_user(db, gtoken) is None, "重置密码后旧会话应失效")
+
+        # ── 停用账号：无法登录；存在第二管理员后原管理员可降级 ──
+        ok(auth.update_user(db, "alice", "guest", {"enabled": False})["ok"], "停用失败")
+        r = auth.login(db, "guest", "reset1234", TEST_IP)
+        ok(not r["ok"] and r["key"] == "auth.err.disabled", f"停用账号应拒绝登录: {r}")
+        ok(auth.create_user(db, "boss", "boss1234", is_admin=True)["ok"], "应可创建管理员")
+        ok(auth.update_user(db, "alice", "boss", {"is_admin": False})["ok"],
+           "非末位管理员应可降级")
+
+        # ── 登录限速 ──
+        ip = TEST_IP
+        for _ in range(auth.MAX_FAILS):
+            auth.login(db, "nobody", "wrong", ip)
+        ok(auth.blocked_seconds(ip) > 0, "连续失败后应临时限速")
+        r = auth.login(db, "alice", "newpass123", ip)
+        ok(not r["ok"] and r["key"] == "auth.err.too_many", f"限速期间应拒绝登录: {r}")
+        ok(auth.blocked_seconds("") == 0, "无来源 IP 信息时不应限速")
+        auth.clear_failures(ip)
+        ok(auth.blocked_seconds(ip) == 0, "清除失败记录后应恢复")
+        ok(auth.login(db, "alice", "newpass123", ip)["ok"], "限速解除后应可登录")
+
+        # ── 登录相关文案：中英双份齐备且可参数化 ──
+        for k in ("auth.err.bad_credentials", "auth.err.too_many", "auth.err.password_len",
+                  "web.login_ok", "web.user_deleted"):
+            ok(k in i18n.MESSAGES and i18n.MESSAGES[k].get("zh") and i18n.MESSAGES[k].get("en"),
+               f"缺少中英双语文案: {k}")
+        ok(i18n.t("auth.err.password_len", "en", min=6) == "Password must be at least 6 characters",
+           "参数化文案异常")
+        ok(i18n.t("web.login_ok", "zh") == "登录成功", "登录成功文案异常")
+        db.close()   # 释放 SQLite 句柄，便于临时目录在 Windows 上被删除
+    print("  [8/8] 账号、权限与登录  ✓")
 
 
 def main():
@@ -400,6 +529,7 @@ def main():
     test_copy()
     test_notify()
     test_i18n()
+    test_auth()
     print(f"\n全部通过：{PASSED} 项断言 ✓")
 
 

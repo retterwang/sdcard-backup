@@ -100,6 +100,9 @@ tasks    (id, card_id, card_alias, trigger, status, phase, started_at, finished_
           total_files, done_files, total_bytes, done_bytes, skipped_*, error_count, result, error)
 task_errors (id, task_id, relpath, message, at)
 settings (k, v)   -- JSON 编码的键值对，界面可改
+users    (username PK COLLATE NOCASE, pass_hash, is_admin, enabled, must_change,
+          created_at, last_login_at, last_login_ip)
+sessions (token PK, username, created_at, expires_at, ip, ua)   -- 登录会话
 ```
 
 ## 4. 任务状态机
@@ -128,7 +131,8 @@ flowchart LR
     MNT --> ENG[增量引擎\n索引比对→复制→哈希校验]
     ENG --> DEST[写入 /backup/卡片别名/…]
     ENG --> IDX[(SQLite 索引库)]
-    API[FastAPI + SSE] --> WEB[Web 界面 :8787]
+    API[FastAPI + SSE] --> AUTH[登录校验\n会话 Cookie]
+    AUTH --> WEB[Web 界面 :8787]
   end
   ENG -. 进度 .-> API
   WEB -. 注册/配置 .-> MATCH
@@ -142,8 +146,25 @@ flowchart LR
 | 写坏存储卡 | 只读挂载 + 程序无任何写卡代码路径 |
 | 误删源文件 | 程序只读取卡，无删除逻辑；"备份后删除"功能刻意不做 |
 | 覆盖已有备份 | 同名不同内容一律加后缀，不覆盖 |
-| 界面被局域网乱用 | 界面无鉴权（个人局域网工具），README 明确禁止公网暴露 |
+| 界面被局域网乱用 | 用户名密码登录 + HttpOnly 会话 Cookie（详见 6.1）；README 明确禁止公网暴露 |
 | 权限过大 | `privileged` 仅服务 `mount/umount`；不写宿主文件（除映射的 data/backup） |
+
+### 6.1 登录与账号
+
+- **密码存储**：`hashlib.pbkdf2_hmac`（PBKDF2-HMAC-SHA256，20 万次迭代 + 16 字节随机盐），
+  落库格式 `pbkdf2_sha256$<迭代>$<盐>$<摘要>`；校验用 `hmac.compare_digest` 常量时间比较。
+  仅标准库实现，不新增依赖。
+- **会话**：随机 `token_urlsafe(32)` 存 `sessions` 表，浏览器只保存 HttpOnly + SameSite=Lax Cookie；
+  默认 7 天，剩余不足一半时滑动续期；改密/重置密码即删除该用户全部会话。
+- **鉴权中间件**：除 `/login`、`/api/auth/login`、`/api/auth/state`、`/api/health`、`/static/*` 外，
+  一律要求有效会话 —— 页面请求 302 跳登录页，接口请求 401。
+- **首登强制改密**：初始管理员（`users` 表为空时自动创建 `admin/admin`）与新建/被重置密码的账号
+  都带 `must_change=1`；此时拦截除 `/api/auth/*` 外的所有接口（403），前端渲染不可关闭的修改层。
+  改密必须同时更换用户名，避免默认账号名继续存在。
+- **越权与误操作防护**：登录失败限速（同 IP 5 分钟 8 次，进程内存态）；不能删除/停用当前登录账号；
+  任何操作后都必须保留至少一个启用状态的管理员；用户 CRUD 接口仅管理员可用。
+- **语言**：登录页与用户管理文案同样走 `app/i18n.py` + `static/i18n.js` 双份字典；登录失败原因
+  由后端按 `?lang=` 渲染后返回，前端直接展示。
 
 ## 7. 已知限制与可扩展方向
 

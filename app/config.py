@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 APP_NAME = "存储卡备份控制台"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # 数据目录：SQLite 索引库、配置（必须持久化——增量判断依赖它）
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -22,6 +22,20 @@ MOUNT_BASE = os.environ.get("MOUNT_BASE", "/mnt/sdbak-cards")
 
 # Web 管理界面端口
 PORT = int(os.environ.get("PORT", "8787"))
+
+# ── 账号与登录 ────────────────────────────────────────────────
+# 首次启动且数据库内没有任何用户时，自动创建的管理员账号（登录后强制修改）
+INITIAL_ADMIN_USER = os.environ.get("INITIAL_ADMIN_USER", "admin")
+INITIAL_ADMIN_PASSWORD = os.environ.get("INITIAL_ADMIN_PASSWORD", "admin")
+
+# 登录会话有效期（秒，滑动续期：每次访问不足一半时自动延长）
+SESSION_TTL = int(os.environ.get("SESSION_TTL", str(7 * 24 * 3600)))
+SESSION_COOKIE = "sdbak_session"
+
+# 用户名 / 密码长度约束（改密界面的提示与后端校验共用）
+MIN_USERNAME_LEN = 2
+MAX_USERNAME_LEN = 32
+MIN_PASSWORD_LEN = 6
 
 # 默认业务设置：首次运行写入数据库；之后以数据库为准（界面可改）
 DEFAULT_SETTINGS = {

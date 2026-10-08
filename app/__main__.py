@@ -6,7 +6,7 @@ import os
 
 import uvicorn
 
-from . import config
+from . import auth, config
 from .db import DB
 from .runner import AppState, Runner
 from .web import create_app
@@ -27,11 +27,15 @@ def main():
                     config.BACKUP_ROOT, e)
 
     db = DB(config.DB_PATH)
+    auth.ensure_default_admin(db)
     state = AppState(db)
     runner = Runner(db, state)
     runner.start()
 
     app = create_app(db, state, runner)
+    pending = [u["username"] for u in db.users_all() if u["must_change"]]
+    if pending:
+        log.warning("以下账号尚未修改初始密码：%s（界面登录后会要求修改）", "、".join(pending))
     log.info("%s v%s 启动 | 端口 %s | 备份根目录 %s",
              config.APP_NAME, config.VERSION, config.PORT, config.BACKUP_ROOT)
     uvicorn.run(app, host="0.0.0.0", port=config.PORT, log_level="warning")

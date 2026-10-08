@@ -2,6 +2,9 @@
 
 所有面向用户的消息均通过 app/i18n.py 输出，语言由请求参数 ?lang= 或
 Accept-Language 头决定（默认中文）。
+
+除 ``/login``、``/api/auth/login``、``/api/health`` 与 ``/static/*`` 外，
+所有路由都需要登录会话（Cookie）；未登录的页面请求重定向到 /login。
 """
 from __future__ import annotations
 
@@ -13,15 +16,18 @@ import time
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, detector, i18n, media
+from . import auth, config, detector, i18n, media
 
 log = logging.getLogger("web")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# 无需登录即可访问的路径
+PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/state", "/api/health"}
 
 
 def _lang(request: Request) -> str:
@@ -30,6 +36,21 @@ def _lang(request: Request) -> str:
         request.query_params.get("lang"),
         request.headers.get("accept-language"),
     )
+
+
+def _client_ip(request: Request) -> str:
+    """来源 IP：优先取反向代理头（frp/nginx 场景），否则用直连地址。"""
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff:
+        return xff.split(",")[0].strip()
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    return request.client.host if request.client else ""
+
+
+def _err(key: str, lang: str, status: int = 400, **params) -> HTTPException:
+    return HTTPException(status, i18n.t(key, lang, **params))
 
 
 class CardPayload(BaseModel):
@@ -55,14 +76,69 @@ class SettingsPayload(BaseModel):
     notify_lang: Optional[str] = None
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class CredentialsPayload(BaseModel):
+    current_password: str
+    new_username: Optional[str] = None
+    new_password: Optional[str] = None
+    confirm_password: Optional[str] = None
+
+
+class UserPayload(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    is_admin: Optional[bool] = None
+    enabled: Optional[bool] = None
+    must_change: Optional[bool] = None
+
+
 def create_app(db, state, runner) -> FastAPI:
     app = FastAPI(title="SD Card Backup Console", version=config.VERSION)
+
+    def cur_user(request: Request):
+        """当前登录用户（认证中间件已注入；理论上不会为空）。"""
+        return getattr(request.state, "user", None)
+
+    def require_admin(request: Request):
+        u = cur_user(request)
+        if not u or not u["is_admin"]:
+            raise _err("auth.err.admin_only", _lang(request), 403)
+
+    def set_session_cookie(resp, token: str):
+        resp.set_cookie(
+            config.SESSION_COOKIE, token,
+            max_age=config.SESSION_TTL, httponly=True, samesite="lax", path="/",
+        )
+
+    @app.middleware("http")
+    async def auth_gate(request: Request, call_next):
+        """登录校验：未登录重定向（页面）或 401（接口）；首登未改密时只放行账号接口。"""
+        p = request.url.path
+        if p in PUBLIC_PATHS or p.startswith("/static/") or p == "/favicon.ico":
+            return await call_next(request)
+        lang = _lang(request)
+        user = auth.current_user(db, request.cookies.get(config.SESSION_COOKIE))
+        if not user:
+            if p.startswith("/api/"):
+                return JSONResponse({"detail": i18n.t("auth.err.login_required", lang)},
+                                    status_code=401)
+            return RedirectResponse("/login", status_code=302)
+        if user["must_change"] and p.startswith("/api/") and not p.startswith("/api/auth/"):
+            # 首次登录必须先改密：只拦截业务接口，页面仍可加载（由前端弹出强制修改层）
+            return JSONResponse({"detail": i18n.t("auth.err.must_change", lang)},
+                                status_code=403)
+        request.state.user = user
+        return await call_next(request)
 
     @app.middleware("http")
     async def no_cache(request: Request, call_next):
         resp = await call_next(request)
         p = request.url.path
-        if p in ("/", "/index.html") or p.endswith((".js", ".css")):
+        if p in ("/", "/index.html", "/login") or p.endswith((".js", ".css")):
             resp.headers["Cache-Control"] = "no-cache"
         return resp
 
@@ -72,6 +148,95 @@ def create_app(db, state, runner) -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def index():
         return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+    @app.get("/login", include_in_schema=False)
+    async def login_page():
+        return FileResponse(os.path.join(STATIC_DIR, "login.html"))
+
+    # ── 登录 / 登出 / 账号 ──
+    @app.post("/api/auth/login")
+    async def auth_login(p: LoginPayload, request: Request):
+        lang = _lang(request)
+        r = auth.login(db, p.username, p.password, _client_ip(request),
+                       request.headers.get("user-agent") or "")
+        if not r["ok"]:
+            raise _err(r["key"], lang, 401 if r["key"] in
+                       ("auth.err.bad_credentials", "auth.err.disabled") else 400,
+                       **r.get("params") or {})
+        resp = JSONResponse({"ok": True, "user": r["user"],
+                             "message": i18n.t("web.login_ok", lang)})
+        set_session_cookie(resp, r["token"])
+        return resp
+
+    @app.post("/api/auth/logout")
+    async def auth_logout(request: Request):
+        lang = _lang(request)
+        auth.logout(db, request.cookies.get(config.SESSION_COOKIE))
+        resp = JSONResponse({"ok": True, "message": i18n.t("web.logout_ok", lang)})
+        resp.delete_cookie(config.SESSION_COOKIE, path="/")
+        return resp
+
+    @app.get("/api/auth/me")
+    async def auth_me(request: Request):
+        return {"user": auth.public_user(cur_user(request))}
+
+    @app.get("/api/auth/state")
+    async def auth_state(request: Request):
+        """公开接口：返回会话状态（登录页据此判断是否已登录，避免 401 控制台噪声）。"""
+        u = auth.current_user(db, request.cookies.get(config.SESSION_COOKIE))
+        return {"user": auth.public_user(u) if u else None}
+
+    @app.post("/api/auth/change-credentials")
+    async def auth_change_credentials(p: CredentialsPayload, request: Request):
+        lang = _lang(request)
+        u = cur_user(request)
+        r = auth.change_credentials(
+            db, u["username"], p.current_password, p.new_username, p.new_password,
+            p.confirm_password, require_new_username=bool(u["must_change"]),
+        )
+        if not r["ok"]:
+            raise _err(r["key"], lang, 400, **(r.get("params") or {}))
+        resp = JSONResponse({"ok": True, "user": r["user"],
+                             "message": i18n.t("web.credentials_changed", lang)})
+        set_session_cookie(resp, r["token"])
+        return resp
+
+    # ── 用户管理（管理员） ──
+    @app.get("/api/users")
+    async def users_list(request: Request):
+        require_admin(request)
+        return {"users": auth.list_users(db),
+                "me": cur_user(request)["username"]}
+
+    @app.post("/api/users")
+    async def user_create(p: UserPayload, request: Request):
+        require_admin(request)
+        lang = _lang(request)
+        r = auth.create_user(db, p.username or "", p.password or "", bool(p.is_admin))
+        if not r["ok"]:
+            raise _err(r["key"], lang, 400, **(r.get("params") or {}))
+        return {"ok": True, "user": r["user"], "message": i18n.t("web.user_created", lang)}
+
+    @app.patch("/api/users/{username}")
+    async def user_patch(username: str, p: UserPayload, request: Request):
+        require_admin(request)
+        lang = _lang(request)
+        patch = {"password": p.password, "is_admin": p.is_admin,
+                 "enabled": p.enabled, "must_change": p.must_change}
+        patch = {k: v for k, v in patch.items() if v is not None}
+        r = auth.update_user(db, cur_user(request)["username"], username, patch)
+        if not r["ok"]:
+            raise _err(r["key"], lang, 400, **(r.get("params") or {}))
+        return {"ok": True, "user": r["user"], "message": i18n.t("web.user_updated", lang)}
+
+    @app.delete("/api/users/{username}")
+    async def user_delete(username: str, request: Request):
+        require_admin(request)
+        lang = _lang(request)
+        r = auth.delete_user(db, cur_user(request)["username"], username)
+        if not r["ok"]:
+            raise _err(r["key"], lang, 400, **(r.get("params") or {}))
+        return {"ok": True, "message": i18n.t("web.user_deleted", lang)}
 
     # ── 状态 ──
     @app.get("/api/health")

@@ -26,6 +26,11 @@
       <button type="button" class="lang-btn" data-lang="en">EN</button>
     </div>
     <button class="btn ghost" data-action="rescan" data-i18n="top.rescan">重新扫描设备</button>
+    <span class="user-chip" id="user-chip" title="">
+      <span class="avatar">👤</span><b id="user-name" data-i18n="auth.anonymous">未登录</b>
+    </span>
+    <button class="btn ghost" data-action="account" data-i18n="top.account">账号设置</button>
+    <button class="btn ghost" data-action="logout" data-i18n="top.logout">退出登录</button>
   </div>
 </header>
 
@@ -41,6 +46,7 @@
     <button class="tab" data-tab="cards" data-i18n="tab.cards">存储卡</button>
     <button class="tab" data-tab="tasks" data-i18n="tab.tasks">任务记录</button>
     <button class="tab" data-tab="settings" data-i18n="tab.settings">设置</button>
+    <button class="tab" data-tab="users" id="tab-users-btn">账号</button>
   </nav>
 
   <section id="tab-dash" class="tabpane active">
@@ -136,7 +142,77 @@
       </ul>
     </div>
   </section>
+
+  <section id="tab-users" class="tabpane">
+    <div class="card" id="users-admin-card" hidden>
+      <div class="card-head">
+        <h2 data-i18n="sec.users">用户列表</h2>
+        <button class="btn sm ghost" data-action="new-user" data-i18n="users.new">新建用户</button>
+      </div>
+      <p class="hint" data-i18n="hint.users">管理员可以为其他成员创建账号、重置密码或停用账号。</p>
+      <div id="users-table"></div>
+    </div>
+    <div class="card">
+      <h2 data-i18n="sec.my_account">我的账号</h2>
+      <p class="hint" data-i18n="hint.my_account">修改后需重新登录；首次登录必须先修改用户名和密码才能使用控制台。</p>
+      <form id="account-form" class="form-grid" autocomplete="off">
+        <label>
+          <span data-i18n="acct.current_password">当前密码</span>
+          <input type="password" id="a-current" autocomplete="current-password" required>
+        </label>
+        <label>
+          <span data-i18n="acct.new_username">新的用户名</span>
+          <input type="text" id="a-username" autocomplete="username">
+          <small data-i18n="acct.username_hint">2-32 个字符，可用字母、数字、汉字、下划线、点、@ 和连字符。</small>
+        </label>
+        <label>
+          <span data-i18n="acct.new_password">新密码（留空表示不修改）</span>
+          <input type="password" id="a-password" autocomplete="new-password">
+          <small data-i18n="acct.password_hint">至少 6 个字符，且不能与用户名或原密码相同。</small>
+        </label>
+        <label>
+          <span data-i18n="acct.confirm_password">确认新密码</span>
+          <input type="password" id="a-confirm" autocomplete="new-password">
+        </label>
+        <div class="form-foot">
+          <button class="btn" type="submit" data-i18n="acct.save">保存修改</button>
+          <span id="account-status" class="muted"></span>
+        </div>
+      </form>
+    </div>
+  </section>
 </main>
+
+<div id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <h3 data-i18n="first.title">请修改初始用户名和密码</h3>
+    <p class="hint" data-i18n="first.hint">检测到这是首次登录（或密码刚被重置），请立即设置你自己的用户名和密码。</p>
+    <form id="gate-form" class="form-grid" autocomplete="off">
+      <label>
+        <span data-i18n="acct.current_password">当前密码</span>
+        <input type="password" id="g-current" autocomplete="current-password" required>
+      </label>
+      <label>
+        <span data-i18n="acct.new_username">新的用户名</span>
+        <input type="text" id="g-username" autocomplete="username" required>
+        <small data-i18n="acct.username_hint">2-32 个字符，可用字母、数字、汉字、下划线、点、@ 和连字符。</small>
+      </label>
+      <label>
+        <span data-i18n="acct.new_password">新密码</span>
+        <input type="password" id="g-password" autocomplete="new-password" required>
+        <small data-i18n="acct.password_hint">至少 6 个字符，且不能与用户名或原密码相同。</small>
+      </label>
+      <label>
+        <span data-i18n="acct.confirm_password">确认新密码</span>
+        <input type="password" id="g-confirm" autocomplete="new-password" required>
+      </label>
+      <div class="form-foot">
+        <button class="btn" type="submit" data-i18n="first.submit">保存并进入控制台</button>
+        <span id="gate-status" class="err-text"></span>
+      </div>
+    </form>
+  </div>
+</div>
 
 <div id="modal-root"></div>
 <div id="toasts"></div>
