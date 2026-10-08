@@ -4,7 +4,7 @@
 
 挂载策略（按顺序尝试）：
 1. 容器内自己只读挂载（首选：设备未被宿主占用时最干净）
-2. 若宿主（绿联 UGOS）已自动挂载了该卡：
+2. 若 NAS 宿主已自动挂载了该卡：
    - 宿主挂载点恰好也映射进了容器 → 直接读取该路径（回退）
    - 否则报错，并在错误信息中给出处理建议
 """
@@ -16,7 +16,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from . import config
+from . import config, i18n
 
 log = logging.getLogger("mounter")
 
@@ -27,7 +27,7 @@ class Mount:
     path: str = ""
     mode: str = "none"      # self-ro / host / none
     by_us: bool = False     # 是否由本程序挂载（决定是否需要卸载）
-    error: str = ""
+    error: str = ""         # i18n 消息（键+参数的 JSON），由界面按语言渲染
 
 
 def _run(cmd: list) -> tuple:
@@ -63,7 +63,8 @@ def ensure_mounted(dev, base: str = None) -> Mount:
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as e:
-        return Mount(node=dev.node, error=f"无法创建挂载点 {target}: {e}")
+        return Mount(node=dev.node,
+                     error=i18n.pack("err.mount_point", path=target, msg=str(e)))
 
     errs = []
     for opts in ("ro,nodev,nosuid,noexec", "ro,nodev", "ro"):
@@ -94,12 +95,8 @@ def ensure_mounted(dev, base: str = None) -> Mount:
             except OSError:
                 continue
 
-    hint = (
-        "无法挂载存储卡。若绿联系统已自动挂载该卡，请在「文件管理→外部设备」里"
-        "先弹出，或把宿主挂载点（如 /mnt/@usb）映射进容器后重试。"
-    )
     detail = "；".join(dict.fromkeys([e for e in errs if e]))[:400]
-    return Mount(node=dev.node, error=f"{hint} 原始错误: {detail}")
+    return Mount(node=dev.node, error=i18n.pack("err.mount_failed", detail=detail))
 
 
 def release(m: Mount):

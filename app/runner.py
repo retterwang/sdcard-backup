@@ -12,15 +12,22 @@ import queue
 import threading
 import time
 
-from . import backup, config, media, notify
+from . import backup, config, i18n, media, notify
 from .detector import Detector
 from .mounter import ensure_mounted, release
 
 log = logging.getLogger("runner")
 
-STATUS_CN = {
-    "done": "完成", "failed": "失败", "interrupted": "已中断", "cancelled": "已取消",
-}
+
+def status_key(status: str) -> str:
+    """任务状态 → i18n 键（界面与通知按各自语言渲染）。"""
+    if status in ("queued", "running", "done", "failed", "interrupted", "cancelled"):
+        return "status." + status
+    return "status.unknown"
+
+
+def status_text(status: str, lang: str = i18n.DEFAULT_LANG) -> str:
+    return i18n.t(status_key(status), lang)
 
 
 def dev_matches_card(dev, card: dict) -> bool:
@@ -49,7 +56,7 @@ class TaskCtx:
         self.lock = threading.RLock()
         self.cancel_event = threading.Event()
         self._cancel_reason = ""
-        self.phase = "排队中"
+        self.phase = "phase.queued"
         self.current_file = ""
         self.total_files = 0
         self.done_files = 0
@@ -64,7 +71,8 @@ class TaskCtx:
     # ── 供引擎调用 ──
     def check_cancel(self):
         if self.cancel_event.is_set():
-            raise backup.CancelError(self._cancel_reason or "任务已取消")
+            raise backup.CancelError(
+                self._cancel_reason or i18n.pack("err.user_cancelled"))
 
     def cancel(self, reason: str):
         self._cancel_reason = reason
@@ -259,7 +267,7 @@ class Runner:
             log.info("存储卡已注册但处于停用状态: %s", card["alias"])
             return
         self.db.card_touch(card["id"])
-        self.enqueue(dev, card, "插入触发")
+        self.enqueue(dev, card, "trigger.insert")
 
     def on_device_removed(self, dev):
         log.info("存储设备已移除: %s", dev.display)
@@ -270,7 +278,7 @@ class Runner:
         if kept:
             release(kept)
         if cur and cur.device_id == dev.card_id:
-            cur.cancel("存储卡已拔出")
+            cur.cancel(i18n.pack("err.card_removed"))
         with self.state.lock:
             self.state.queue = [q for q in self.state.queue if q["card_id"] != dev.card_id]
 
@@ -294,28 +302,28 @@ class Runner:
     def manual_backup(self, card_id: str):
         card = self.db.card_get(card_id)
         if not card:
-            return False, "卡片不存在"
+            return False, "web.card_not_found"
         if not card["enabled"]:
-            return False, "该卡已停用，请先启用"
+            return False, "run.card_disabled"
         dev = self.state.device_by_card(card)
         if not dev:
-            return False, "该卡当前未连接"
-        if self.enqueue(dev, card, "手动触发"):
-            return True, "已加入队列"
-        return False, "该卡已有进行中的任务"
+            return False, "run.card_offline"
+        if self.enqueue(dev, card, "trigger.manual"):
+            return True, "run.enqueued"
+        return False, "run.already_running"
 
     def cancel_task(self, task_id: int):
         with self.state.lock:
             cur = self.state.current
         if cur and cur.task_id == task_id:
-            cur.cancel("用户取消")
-            return True, "正在取消"
-        return False, "该任务未在执行"
+            cur.cancel(i18n.pack("err.user_cancelled"))
+            return True, "run.cancelling"
+        return False, "run.task_not_running"
 
     def unmount_card(self, card_id: str):
         card = self.db.card_get(card_id)
         if not card:
-            return False, "卡片不存在"
+            return False, "web.card_not_found"
         dev = self.state.device_by_card(card)
         m = None
         if dev:
@@ -323,8 +331,8 @@ class Runner:
                 m = self.kept_mounts.pop(dev.card_id, None)
         if m:
             release(m)
-            return True, "已卸载，可安全拔出"
-        return False, "当前没有保持挂载的存储卡（任务进行中或卡未连接）"
+            return True, "run.unmounted"
+        return False, "run.no_held_mount"
 
     def rescan(self):
         self.detector.rescan_now()
@@ -377,13 +385,13 @@ class Runner:
         try:
             delay = float(self.db.setting_get("mount_delay", 4) or 0)
             if delay > 0:
-                ctx.set_phase(f"等待设备就绪（{delay:.0f}s）")
+                ctx.set_phase(i18n.pack("phase.waiting", seconds=f"{delay:.0f}"))
                 time.sleep(delay)
             ctx.check_cancel()
             if not self.state.has_device(dev.card_id):
-                raise backup.CancelError("存储卡已拔出")
+                raise backup.CancelError(i18n.pack("err.card_removed"))
 
-            ctx.set_phase("只读挂载")
+            ctx.set_phase("phase.mounting")
             mount = self.kept_mounts.pop(dev.card_id, None)
             if mount and not (mount.path and os.path.isdir(mount.path)):
                 mount = None  # 残留失效，重新挂载
@@ -417,7 +425,7 @@ class Runner:
                     with self.state.lock:
                         self.kept_mounts[dev.card_id] = mount
                 else:
-                    ctx.set_phase("卸载")
+                    ctx.set_phase("phase.unmounting")
                     release(mount)
             try:
                 extra = {}
@@ -428,7 +436,7 @@ class Runner:
                     task_id, status,
                     total_files=ctx.total_files, done_files=ctx.done_files,
                     total_bytes=ctx.total_bytes, done_bytes=ctx.done_bytes,
-                    error_count=ctx.error_count, phase=STATUS_CN.get(status, status),
+                    error_count=ctx.error_count, phase=status_key(status),
                     result=result_line, error=error, **extra,
                 )
             except Exception:
@@ -446,31 +454,35 @@ class Runner:
 
     @staticmethod
     def _summary(res: dict) -> str:
-        parts = [f"新增 {res['copied']} 个（{media.fmt_bytes(res['planned_bytes'])}）"]
-        reused = res["reused"]
-        if reused:
-            parts.append(f"目标已存在 {reused} 个")
-        parts.append(f"索引跳过 {res['skipped']} 个")
-        if res["error_count"]:
-            parts.append(f"失败 {res['error_count']} 个")
-        if res["planned_files"] == 0 and res["skipped"] == 0:
-            parts.append("卡内无可备份的媒体文件")
-        elif res["planned_files"] == 0:
-            parts.append("无新增文件")
-        return "，".join(parts)
+        """任务结果摘要：落库为「消息键 + 参数」，由界面/通知按语言渲染。"""
+        return i18n.pack(
+            "task.summary",
+            copied=res["copied"],
+            bytes=media.fmt_bytes(res["planned_bytes"]),
+            reused=res["reused"],
+            skipped=res["skipped"],
+            failed=res["error_count"],
+            empty=(res["planned_files"] == 0 and res["skipped"] == 0),
+            nonew=(res["planned_files"] == 0 and res["skipped"] != 0),
+        )
 
     def _notify(self, card: dict, status: str, text: str):
         url = self.db.setting_get("notify_url", "") or ""
         if not url.startswith(("http://", "https://", "smtp+ssl://", "smtp://")):
             return
-        title = f"[存储卡备份] {card['alias']} {STATUS_CN.get(status, status)}"
+        # 通知语言独立于浏览器界面语言（设置项 notify_lang）
+        lang = i18n.normalize_lang(self.db.setting_get("notify_lang", i18n.DEFAULT_LANG))
+        st = status_text(status, lang)
+        detail = i18n.render_stored(text, lang) or i18n.t("notify.empty", lang)
+        title = i18n.t("notify.title", lang, alias=card["alias"], status=st)
         content = "\n".join([
-            f"卡片：{card['alias']}",
-            f"状态：{STATUS_CN.get(status, status)}",
-            f"详情：{text or '—'}",
-            f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            i18n.t("notify.line.card", lang, v=card["alias"]),
+            i18n.t("notify.line.status", lang, v=st),
+            i18n.t("notify.line.detail", lang, v=detail),
+            i18n.t("notify.line.time", lang,
+                   v=time.strftime("%Y-%m-%d %H:%M:%S")),
         ])
-        ok, msg = notify.send(url, title, content)
+        ok, msg = notify.send(url, title, content, lang=lang)
         if ok:
             log.info("通知已发送: %s（%s）", title, msg)
         else:

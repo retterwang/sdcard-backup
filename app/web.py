@@ -1,4 +1,8 @@
-"""FastAPI 应用：REST 接口 + SSE 实时状态 + 静态界面。"""
+"""FastAPI 应用：REST 接口 + SSE 实时状态 + 静态界面。
+
+所有面向用户的消息均通过 app/i18n.py 输出，语言由请求参数 ?lang= 或
+Accept-Language 头决定（默认中文）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,11 +17,19 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, detector, media
+from . import config, detector, i18n, media
 
 log = logging.getLogger("web")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _lang(request: Request) -> str:
+    """解析请求语言：?lang= 优先，其次 Accept-Language。"""
+    return i18n.from_request(
+        request.query_params.get("lang"),
+        request.headers.get("accept-language"),
+    )
 
 
 class CardPayload(BaseModel):
@@ -40,10 +52,11 @@ class SettingsPayload(BaseModel):
     auto_unmount: Optional[bool] = None
     auto_accept: Optional[bool] = None
     notify_url: Optional[str] = None
+    notify_lang: Optional[str] = None
 
 
 def create_app(db, state, runner) -> FastAPI:
-    app = FastAPI(title=config.APP_NAME, version=config.VERSION)
+    app = FastAPI(title="SD Card Backup Console", version=config.VERSION)
 
     @app.middleware("http")
     async def no_cache(request: Request, call_next):
@@ -89,13 +102,13 @@ def create_app(db, state, runner) -> FastAPI:
         )
 
     @app.post("/api/rescan")
-    async def rescan():
+    async def rescan(request: Request):
         runner.rescan()
-        return {"ok": True, "message": "已触发重新扫描"}
+        return {"ok": True, "message": i18n.t("web.rescan_done", _lang(request))}
 
     @app.get("/api/diagnose")
     def diagnose():
-        """运行环境自检（检测不到卡时用于排查）。"""
+        """运行环境自检（检测不到卡时用于排查）。诊断信息面向维护者，保持中文原文。"""
         return detector.diagnose()
 
     # ── 卡片白名单 ──
@@ -104,7 +117,8 @@ def create_app(db, state, runner) -> FastAPI:
         return {"cards": state.snapshot()["cards"]}
 
     @app.post("/api/cards")
-    async def card_create(p: CardPayload):
+    async def card_create(p: CardPayload, request: Request):
+        lang = _lang(request)
         dev = None
         card_id = None
         if p.card_id:
@@ -118,11 +132,11 @@ def create_app(db, state, runner) -> FastAPI:
         elif p.fs_uuid:
             card_id = f"fs:{p.fs_uuid}"
         if not card_id:
-            raise HTTPException(400, "缺少卡片标识（card_id 或 fs_uuid）")
+            raise HTTPException(400, i18n.t("web.card_id_required", lang))
         if db.card_get(card_id):
-            raise HTTPException(409, "该存储卡已注册过")
+            raise HTTPException(409, i18n.t("web.card_exists", lang))
 
-        alias = (p.alias or (dev.display.split(" · ")[0] if dev else "") or "存储卡").strip()[:60]
+        alias = (p.alias or (dev.display.split(" · ")[0] if dev else "") or "SD Card").strip()[:60]
         organize = p.organize if p.organize in ("date", "mirror") else "date"
         subdir = runner._unique_subdir(media.slug_subdir(p.dest_subdir or alias))
         record = {
@@ -143,27 +157,29 @@ def create_app(db, state, runner) -> FastAPI:
         card = db.card_create(record)
         triggered = False
         if dev and card["enabled"]:
-            triggered = runner.enqueue(dev, card, "注册后触发")
+            triggered = runner.enqueue(dev, card, "trigger.after_register")
         return {
             "ok": True, "card": card, "triggered": triggered,
-            "message": "已注册" + ("，并开始首次备份" if triggered else ""),
+            "message": i18n.t("web.card_registered_started" if triggered
+                              else "web.card_registered", lang),
         }
 
     @app.patch("/api/cards/{cid}")
-    async def card_patch(cid: str, p: CardPayload):
+    async def card_patch(cid: str, p: CardPayload, request: Request):
+        lang = _lang(request)
         if not db.card_get(cid):
-            raise HTTPException(404, "卡片不存在")
+            raise HTTPException(404, i18n.t("web.card_not_found", lang))
         patch = {}
         if p.alias is not None:
             a = p.alias.strip()
             if not a:
-                raise HTTPException(400, "别名不能为空")
+                raise HTTPException(400, i18n.t("web.alias_required", lang))
             patch["alias"] = a[:60]
         if p.dest_subdir is not None:
             patch["dest_subdir"] = runner._unique_subdir(media.slug_subdir(p.dest_subdir))
         if p.organize is not None:
             if p.organize not in ("date", "mirror"):
-                raise HTTPException(400, "organize 仅支持 date / mirror")
+                raise HTTPException(400, i18n.t("web.organize_invalid", lang))
             patch["organize"] = p.organize
         for k in ("enabled", "all_files"):
             v = getattr(p, k)
@@ -177,63 +193,82 @@ def create_app(db, state, runner) -> FastAPI:
         return {"ok": True, "card": card}
 
     @app.delete("/api/cards/{cid}")
-    async def card_delete(cid: str):
+    async def card_delete(cid: str, request: Request):
+        lang = _lang(request)
         if not db.card_get(cid):
-            raise HTTPException(404, "卡片不存在")
+            raise HTTPException(404, i18n.t("web.card_not_found", lang))
         db.card_delete(cid)
-        return {"ok": True, "message": "已移除卡片记录（已备份的文件仍保留在磁盘上）"}
+        return {"ok": True, "message": i18n.t("web.card_removed", lang)}
 
     @app.post("/api/cards/{cid}/backup-now")
-    async def card_backup_now(cid: str):
+    async def card_backup_now(cid: str, request: Request):
+        lang = _lang(request)
         ok, msg = runner.manual_backup(cid)
         if not ok:
-            raise HTTPException(400, msg)
-        return {"ok": True, "message": msg}
+            raise HTTPException(400, i18n.t(msg, lang))
+        return {"ok": True, "message": i18n.t(msg, lang)}
 
     @app.post("/api/cards/{cid}/reset-index")
-    async def card_reset_index(cid: str):
+    async def card_reset_index(cid: str, request: Request):
+        lang = _lang(request)
         if not db.card_get(cid):
-            raise HTTPException(404, "卡片不存在")
+            raise HTTPException(404, i18n.t("web.card_not_found", lang))
         db.card_reset_index(cid)
-        return {"ok": True, "message": "索引已清除，下次插入将重新全量比对（不会覆盖已有文件）"}
+        return {"ok": True, "message": i18n.t("web.index_reset", lang)}
 
     @app.post("/api/cards/{cid}/unmount")
-    async def card_unmount(cid: str):
+    async def card_unmount(cid: str, request: Request):
+        lang = _lang(request)
         ok, msg = runner.unmount_card(cid)
         if not ok:
-            raise HTTPException(400, msg)
-        return {"ok": True, "message": msg}
+            raise HTTPException(400, i18n.t(msg, lang))
+        return {"ok": True, "message": i18n.t(msg, lang)}
 
     # ── 任务 ──
     @app.get("/api/tasks")
-    async def tasks_list(limit: int = 50):
+    async def tasks_list(request: Request, limit: int = 50):
+        lang = _lang(request)
         limit = max(1, min(limit, 200))
-        return {"tasks": db.tasks_recent(limit)}
+        rows = db.tasks_recent(limit)
+        for r in rows:
+            r["result"] = i18n.render_stored(r.get("result"), lang)
+            r["error"] = i18n.render_stored(r.get("error"), lang)
+            r["phase"] = i18n.render_stored(r.get("phase"), lang)
+        return {"tasks": rows}
 
     @app.get("/api/tasks/{tid}")
-    async def task_detail(tid: int):
+    async def task_detail(tid: int, request: Request):
+        lang = _lang(request)
         t = db.task_get(tid)
         if not t:
-            raise HTTPException(404, "任务不存在")
-        t["errors"] = db.task_errors(tid)
+            raise HTTPException(404, i18n.t("web.task_not_found", lang))
+        t["result"] = i18n.render_stored(t.get("result"), lang)
+        t["error"] = i18n.render_stored(t.get("error"), lang)
+        t["phase"] = i18n.render_stored(t.get("phase"), lang)
+        t["errors"] = [
+            dict(e, message=i18n.render_stored(e.get("message"), lang))
+            for e in db.task_errors(tid)
+        ]
         return t
 
     @app.post("/api/tasks/{tid}/cancel")
-    async def task_cancel(tid: int):
+    async def task_cancel(tid: int, request: Request):
+        lang = _lang(request)
         ok, msg = runner.cancel_task(tid)
         if not ok:
-            raise HTTPException(400, msg)
-        return {"ok": True, "message": msg}
+            raise HTTPException(400, i18n.t(msg, lang))
+        return {"ok": True, "message": i18n.t(msg, lang)}
 
     @app.post("/api/tasks/{tid}/retry")
-    async def task_retry(tid: int):
+    async def task_retry(tid: int, request: Request):
+        lang = _lang(request)
         t = db.task_get(tid)
         if not t:
-            raise HTTPException(404, "任务不存在")
+            raise HTTPException(404, i18n.t("web.task_not_found", lang))
         ok, msg = runner.manual_backup(t["card_id"])
         if not ok:
-            raise HTTPException(400, msg)
-        return {"ok": True, "message": msg}
+            raise HTTPException(400, i18n.t(msg, lang))
+        return {"ok": True, "message": i18n.t(msg, lang)}
 
     # ── 设置 ──
     @app.get("/api/settings")
@@ -241,15 +276,16 @@ def create_app(db, state, runner) -> FastAPI:
         return db.settings_all()
 
     @app.put("/api/settings")
-    async def settings_put(p: SettingsPayload):
+    async def settings_put(p: SettingsPayload, request: Request):
+        lang = _lang(request)
         patch = {}
         if p.scan_interval is not None:
             if not 1 <= p.scan_interval <= 120:
-                raise HTTPException(400, "扫描间隔需在 1-120 秒之间")
+                raise HTTPException(400, i18n.t("web.scan_interval_range", lang))
             patch["scan_interval"] = int(p.scan_interval)
         if p.mount_delay is not None:
             if not 0 <= p.mount_delay <= 300:
-                raise HTTPException(400, "挂载延迟需在 0-300 秒之间")
+                raise HTTPException(400, i18n.t("web.mount_delay_range", lang))
             patch["mount_delay"] = int(p.mount_delay)
         for k in ("verify", "auto_unmount", "auto_accept"):
             v = getattr(p, k)
@@ -258,8 +294,13 @@ def create_app(db, state, runner) -> FastAPI:
         if p.notify_url is not None:
             u = p.notify_url.strip()
             if u and not u.startswith(("http://", "https://", "smtp+ssl://", "smtp://")):
-                raise HTTPException(400, "通知地址需以 http(s):// 或 smtp+ssl:// 开头")
+                raise HTTPException(400, i18n.t("web.notify_url_invalid", lang))
             patch["notify_url"] = u[:500]
+        if p.notify_lang is not None:
+            v = str(p.notify_lang).strip().lower()
+            if v not in i18n.LANGS:
+                raise HTTPException(400, i18n.t("web.notify_lang_invalid", lang))
+            patch["notify_lang"] = v
         if patch:
             db.settings_set_many(patch)
         return {"ok": True, "settings": db.settings_all()}

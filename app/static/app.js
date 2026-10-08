@@ -1,5 +1,7 @@
 'use strict';
-/* 存储卡备份控制台 —— 前端逻辑（SSE 实时刷新 + 事件委托，无第三方依赖） */
+/* 存储卡备份控制台 —— 前端逻辑（SSE 实时刷新 + 事件委托，无第三方依赖）
+ * 所有文案经 i18n.js 的 T()/trMsg() 输出，支持中英切换。
+ */
 
 const $ = (s, el) => (el || document).querySelector(s);
 
@@ -7,12 +9,17 @@ let SNAP = null;
 let ES = null;
 let settingsDirty = false;
 let prevCurrentTaskId = null;
+let connOk = null;
+let lastSnapKey = null;
 
 /* ────────────────────────── 工具 ────────────────────────── */
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
+}
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString(getLang() === 'en' ? 'en-US' : 'zh-CN');
 }
 function fmtBytes(n) {
   n = Number(n || 0);
@@ -29,22 +36,23 @@ function fmtTime(ts) {
 function fmtDur(start, end) {
   if (!start) return '—';
   const s = Math.max(0, (end || Date.now() / 1000) - start);
-  if (s < 60) return Math.round(s) + ' 秒';
-  if (s < 3600) return (s / 60).toFixed(1) + ' 分钟';
-  return (s / 3600).toFixed(1) + ' 小时';
+  if (s < 60) return Math.round(s) + ' ' + T('unit.second');
+  if (s < 3600) return (s / 60).toFixed(1) + ' ' + T('unit.minute');
+  return (s / 3600).toFixed(1) + ' ' + T('unit.hour');
 }
 function fmtEta(s) {
   if (s == null) return '—';
-  if (s < 60) return Math.round(s) + ' 秒';
-  if (s < 3600) return Math.round(s / 60) + ' 分钟';
-  return (s / 3600).toFixed(1) + ' 小时';
+  if (s < 60) return Math.round(s) + ' ' + T('unit.second');
+  if (s < 3600) return Math.round(s / 60) + ' ' + T('unit.minute');
+  return (s / 3600).toFixed(1) + ' ' + T('unit.hour');
 }
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  const url = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'lang=' + getLang();
+  const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
   let data = {};
   try { data = await r.json(); } catch (e) { /* 空响应 */ }
-  if (!r.ok) throw new Error((data && data.detail) || ('请求失败 HTTP ' + r.status));
+  if (!r.ok) throw new Error((data && data.detail) || T('toast.request_failed', { status: r.status }));
   return data;
 }
 
@@ -56,24 +64,31 @@ function toast(msg, type = 'ok') {
   setTimeout(() => el.remove(), 4200);
 }
 
-const STATUS_MAP = {
-  queued: ['排队中', 'muted'], running: ['备份中', 'run'],
-  done: ['完成', 'ok'], failed: ['失败', 'err'],
-  interrupted: ['已中断', 'warn'], cancelled: ['已取消', 'muted'],
+const STATUS_CLS = {
+  queued: 'muted', running: 'run', done: 'ok',
+  failed: 'err', interrupted: 'warn', cancelled: 'muted',
 };
 function chip(status, errorCount) {
-  const m = STATUS_MAP[status] || [status || '未知', 'muted'];
-  let cls = m[1];
+  let cls = STATUS_CLS[status] || 'muted';
   if (status === 'done' && errorCount > 0) cls = 'warn';
-  const label = status === 'done' && errorCount > 0 ? `完成（${errorCount} 个失败）` : m[0];
+  const label = (status === 'done' && errorCount > 0)
+    ? T('status.done_with_errors', { n: errorCount })
+    : T('status.' + (status || 'unknown'));
   return `<span class="chip ${cls}">${esc(label)}</span>`;
 }
 
 /* ────────────────────────── 连接 ────────────────────────── */
-function setConn(ok) {
+function renderConn() {
   const el = $('#conn');
+  if (!el) return;
+  const ok = connOk === true;
   el.className = 'conn ' + (ok ? 'ok' : 'off');
-  el.innerHTML = `<i></i>${ok ? '已连接' : '连接断开，重试中…'}`;
+  el.innerHTML = `<i></i>${esc(T(ok ? 'top.connected' : 'top.lost'))}`;
+}
+function setConn(ok) {
+  if (connOk === ok) return;
+  connOk = ok;
+  renderConn();
 }
 
 function connect() {
@@ -82,10 +97,22 @@ function connect() {
   ES.onopen = () => setConn(true);
   ES.onmessage = ev => {
     setConn(true);
-    try { SNAP = JSON.parse(ev.data); } catch (e) { return; }
+    let snap;
+    try { snap = JSON.parse(ev.data); } catch (e) { return; }
+    SNAP = snap;
+    // 快照未变化时跳过重绘：避免每秒重建 DOM 造成的闪烁与点击落空
+    const key = snapKey(snap);
+    if (key === lastSnapKey) return;
+    lastSnapKey = key;
     render();
   };
   ES.onerror = () => setConn(false);
+}
+
+function snapKey(snap) {
+  const c = Object.assign({}, snap);
+  delete c.now;               // 时间戳每秒都变，不参与比较
+  return JSON.stringify(c);
 }
 
 /* ────────────────────────── 渲染 ────────────────────────── */
@@ -101,7 +128,10 @@ function render() {
 
 function renderHero() {
   const el = $('#hero');
-  if (!SNAP) { el.innerHTML = '<div class="hero-idle"><div class="big">正在连接后端…</div></div>'; return; }
+  if (!SNAP) {
+    el.innerHTML = `<div class="hero-idle"><div class="big">${esc(T('hero.connecting'))}</div></div>`;
+    return;
+  }
   const cur = SNAP.current;
   const devices = SNAP.devices || [];
   const unreg = devices.filter(d => !d.registered);
@@ -109,59 +139,62 @@ function renderHero() {
   let h = '';
 
   if (cur) {
-    if (cur.task_id !== prevCurrentTaskId) { toast(`开始备份：${cur.alias}`, 'info'); prevCurrentTaskId = cur.task_id; }
+    if (cur.task_id !== prevCurrentTaskId) {
+      toast(T('toast.backup_started', { alias: cur.alias }), 'info');
+      prevCurrentTaskId = cur.task_id;
+    }
     const pct = cur.percent == null ? 0 : cur.percent;
     h = `
       <div class="hero-run">
         <div class="hero-head">
-          <span class="chip run">备份中</span>
+          <span class="chip run">${esc(T('hero.backing_up'))}</span>
           <span class="hero-title">${esc(cur.alias)}</span>
-          <span class="muted">${esc(cur.phase)}</span>
+          <span class="muted">${esc(trMsg(cur.phase))}</span>
         </div>
         <div class="bar"><div class="bar-in" style="width:${Math.min(100, pct)}%"></div></div>
         <div class="hero-meta">
-          <span>文件 <b>${cur.done_files}</b> / ${cur.total_files}</span>
-          <span>数据 <b>${fmtBytes(cur.done_bytes)}</b> / ${fmtBytes(cur.total_bytes)}</span>
-          <span>速度 <b>${fmtBytes(cur.speed)}/s</b></span>
-          <span>预计剩余 <b>${fmtEta(cur.eta)}</b></span>
-          ${cur.error_count ? `<span class="err-text">失败 ${cur.error_count}</span>` : ''}
+          <span>${esc(T('hero.files'))} <b>${cur.done_files}</b> / ${cur.total_files}</span>
+          <span>${esc(T('hero.data'))} <b>${fmtBytes(cur.done_bytes)}</b> / ${fmtBytes(cur.total_bytes)}</span>
+          <span>${esc(T('hero.speed'))} <b>${fmtBytes(cur.speed)}/s</b></span>
+          <span>${esc(T('hero.eta'))} <b>${fmtEta(cur.eta)}</b></span>
+          ${cur.error_count ? `<span class="err-text">${esc(T('hero.failed', { n: cur.error_count }))}</span>` : ''}
         </div>
         <div class="curfile mono">${esc(cur.current_file || '…')}</div>
         <div class="hero-actions">
-          <button class="btn danger" data-action="cancel-task" data-id="${cur.task_id}">取消任务</button>
+          <button class="btn danger" data-action="cancel-task" data-id="${cur.task_id}">${esc(T('hero.cancel'))}</button>
         </div>
       </div>`;
   } else if (unreg.length) {
     const d = unreg[0];
     h = `
       <div class="hero-idle warnbox">
-        <div class="big">检测到未注册存储卡</div>
+        <div class="big">${esc(T('hero.unregistered'))}</div>
         <div class="sub2">${esc(d.display)} · <span class="mono">${esc(d.node)}</span></div>
-        <div class="hint">默认只备份已注册的卡。注册后，这张卡每次插入都会自动开始增量备份。</div>
+        <div class="hint">${esc(T('hero.unregistered_hint'))}</div>
         <div class="hero-actions">
-          <button class="btn" data-action="register-dev" data-id="${esc(d.card_id)}">注册并启用这张卡</button>
+          <button class="btn" data-action="register-dev" data-id="${esc(d.card_id)}">${esc(T('hero.register_enable'))}</button>
         </div>
       </div>`;
   } else if (regConnected.length) {
     const d = regConnected[0];
     h = `
       <div class="hero-idle okbox">
-        <div class="big">已连接：${esc(d.alias || d.display)}</div>
+        <div class="big">${esc(T('hero.connected', { name: d.alias || d.display }))}</div>
         <div class="sub2">${esc(d.display)} · <span class="mono">${esc(d.node)}</span></div>
-        <div class="hint">插入自动备份已触发完成；也可以手动发起一次增量检查（无新增时几秒内结束）。</div>
+        <div class="hint">${esc(T('hero.auto_done'))}</div>
         <div class="hero-actions">
-          <button class="btn" data-action="backup-now" data-id="${esc(d.card_id)}">立即备份</button>
-          <button class="btn ghost" data-action="eject-card" data-id="${esc(d.card_id)}">卸载（安全拔出）</button>
+          <button class="btn" data-action="backup-now" data-id="${esc(d.card_id)}">${esc(T('hero.backup_now'))}</button>
+          <button class="btn ghost" data-action="eject-card" data-id="${esc(d.card_id)}">${esc(T('hero.eject'))}</button>
         </div>
       </div>`;
   } else {
     const regDevices = devices.filter(d => d.registered);
+    const n = (SNAP.settings && SNAP.settings.scan_interval) || 3;
     h = `
       <div class="hero-idle">
-        <div class="big">未检测到存储卡</div>
-        <div class="hint">把 SD 卡接入读卡器或 NAS 内置卡槽。程序每 ${(SNAP.settings && SNAP.settings.scan_interval) || 3} 秒扫描一次，
-        识别到已注册的卡后会自动开始增量备份，无需任何操作。</div>
-        ${regDevices.length ? '<div class="sub2">提示：检测到已注册但停用的卡</div>' : ''}
+        <div class="big">${esc(T('hero.none'))}</div>
+        <div class="hint">${esc(T('hero.none_hint', { n }))}</div>
+        ${regDevices.length ? `<div class="sub2">${esc(T('hero.disabled_hint'))}</div>` : ''}
       </div>`;
   }
   el.innerHTML = h;
@@ -174,12 +207,11 @@ function renderStats() {
   const cards = SNAP.cards || [];
   let files = 0, bytes = 0;
   cards.forEach(c => { files += c.files || 0; bytes += c.bytes || 0; });
-  const summary = SNAP.last_result || {};
   el.innerHTML = `
-    <div class="stat"><div class="k">已注册卡片</div><div class="v">${cards.length}</div></div>
-    <div class="stat"><div class="k">在线外接设备</div><div class="v">${(SNAP.devices || []).length}</div></div>
-    <div class="stat"><div class="k">累计已备份文件</div><div class="v">${files.toLocaleString()}</div></div>
-    <div class="stat"><div class="k">累计备份数据</div><div class="v">${fmtBytes(bytes)}</div></div>`;
+    <div class="stat"><div class="k">${esc(T('stat.cards'))}</div><div class="v">${cards.length}</div></div>
+    <div class="stat"><div class="k">${esc(T('stat.devices'))}</div><div class="v">${(SNAP.devices || []).length}</div></div>
+    <div class="stat"><div class="k">${esc(T('stat.files'))}</div><div class="v">${fmtNum(files)}</div></div>
+    <div class="stat"><div class="k">${esc(T('stat.bytes'))}</div><div class="v">${fmtBytes(bytes)}</div></div>`;
 }
 
 function renderDevices() {
@@ -187,12 +219,13 @@ function renderDevices() {
   if (!SNAP) return;
   const devices = SNAP.devices || [];
   if (!devices.length) {
-    el.innerHTML = '<div class="empty">未检测到外接存储设备。插入存储卡后自动出现在这里。</div>';
+    el.innerHTML = `<div class="empty">${esc(T('empty.devices'))}</div>`;
     return;
   }
   el.innerHTML = `
-    <table><thead><tr>
-      <th>设备</th><th>节点</th><th>文件系统</th><th>容量</th><th>状态</th><th>操作</th>
+    <div class="table-wrap"><table><thead><tr>
+      <th>${esc(T('th.device'))}</th><th>${esc(T('th.node'))}</th><th>${esc(T('th.fstype'))}</th>
+      <th>${esc(T('th.size'))}</th><th>${esc(T('th.status'))}</th><th>${esc(T('th.ops'))}</th>
     </tr></thead><tbody>
     ${devices.map(d => `
       <tr>
@@ -201,35 +234,35 @@ function renderDevices() {
         <td>${esc(d.fstype)}</td>
         <td>${fmtBytes(d.size)}</td>
         <td>${d.registered
-          ? `<span class="chip ok">已注册</span>${d.enabled ? '' : '<span class="chip muted">已停用</span>'}`
-          : '<span class="chip warn">未注册</span>'}</td>
+          ? `<span class="chip ok">${esc(T('chip.registered'))}</span>${d.enabled ? '' : `<span class="chip muted">${esc(T('chip.disabled'))}</span>`}`
+          : `<span class="chip warn">${esc(T('chip.unregistered'))}</span>`}</td>
         <td><div class="row-actions">
           ${d.registered
-            ? `<button class="btn sm" data-action="backup-now" data-id="${esc(d.card_id)}" ${d.enabled ? '' : 'disabled'}>立即备份</button>`
-            : `<button class="btn sm" data-action="register-dev" data-id="${esc(d.card_id)}">注册</button>`}
+            ? `<button class="btn sm" data-action="backup-now" data-id="${esc(d.card_id)}" ${d.enabled ? '' : 'disabled'}>${esc(T('btn.backup'))}</button>`
+            : `<button class="btn sm" data-action="register-dev" data-id="${esc(d.card_id)}">${esc(T('btn.register'))}</button>`}
         </div></td>
       </tr>`).join('')}
-    </tbody></table>`;
+    </tbody></table></div>`;
 }
 
 function cardRow(c) {
   const ops = `<div class="row-actions">
-        <button class="btn sm" data-action="backup-now" data-id="${esc(c.id)}" ${c.connected && c.enabled ? '' : 'disabled'}>立即备份</button>
-        <button class="btn sm ghost" data-action="edit-card" data-id="${esc(c.id)}">编辑</button>
-        <button class="btn sm ghost" data-action="toggle-card" data-id="${esc(c.id)}">${c.enabled ? '停用' : '启用'}</button>
-        <button class="btn sm ghost" data-action="reset-index" data-id="${esc(c.id)}">清除索引</button>
-        <button class="btn sm danger" data-action="del-card" data-id="${esc(c.id)}">删除</button>
+        <button class="btn sm" data-action="backup-now" data-id="${esc(c.id)}" ${c.connected && c.enabled ? '' : 'disabled'}>${esc(T('btn.backup'))}</button>
+        <button class="btn sm ghost" data-action="edit-card" data-id="${esc(c.id)}">${esc(T('btn.edit'))}</button>
+        <button class="btn sm ghost" data-action="toggle-card" data-id="${esc(c.id)}">${esc(T(c.enabled ? 'btn.disable' : 'btn.enable'))}</button>
+        <button class="btn sm ghost" data-action="reset-index" data-id="${esc(c.id)}">${esc(T('btn.reset_index'))}</button>
+        <button class="btn sm danger" data-action="del-card" data-id="${esc(c.id)}">${esc(T('btn.delete'))}</button>
       </div>`;
   const state = c.enabled
-    ? (c.connected ? '<span class="chip ok">在线</span>' : '<span class="chip muted">未连接</span>')
-    : '<span class="chip warn">已停用</span>';
+    ? (c.connected ? `<span class="chip ok">${esc(T('chip.online'))}</span>` : `<span class="chip muted">${esc(T('chip.offline'))}</span>`)
+    : `<span class="chip warn">${esc(T('chip.disabled'))}</span>`;
   return `
     <tr>
       <td>${esc(c.alias)}<div class="sub-line mono">${esc(c.id)}</div></td>
       <td class="mono">/backup/${esc(c.dest_subdir)}</td>
-      <td>${c.organize === 'mirror' ? '原结构' : '按日期'}</td>
+      <td>${esc(T(c.organize === 'mirror' ? 'organize.mirror' : 'organize.date'))}</td>
       <td>${state}</td>
-      <td>${fmtBytes(c.bytes)}<div class="sub-line">${(c.files || 0).toLocaleString()} 个文件</div></td>
+      <td>${fmtBytes(c.bytes)}<div class="sub-line">${esc(T('files.count', { n: fmtNum(c.files || 0) }))}</div></td>
       <td>${fmtTime(c.last_backup_at)}</td>
       <td>${ops}</td>
     </tr>`;
@@ -241,32 +274,36 @@ function renderCards() {
   if (!SNAP) return;
   const cards = SNAP.cards || [];
   if (!cards.length) {
-    sum.innerHTML = '<div class="empty">还没有注册任何存储卡。插入卡后在「存储卡」页注册。</div>';
-    tab.innerHTML = '<div class="empty">还没有注册任何存储卡。</div>';
+    sum.innerHTML = `<div class="empty">${esc(T('empty.cards'))}</div>`;
+    tab.innerHTML = `<div class="empty">${esc(T('empty.cards_short'))}</div>`;
     return;
   }
   sum.innerHTML = `
-    <table><thead><tr><th>卡片</th><th>状态</th><th>已备份</th><th>最近备份</th><th>操作</th></tr></thead>
+    <div class="table-wrap"><table><thead><tr>
+      <th>${esc(T('th.card'))}</th><th>${esc(T('th.status'))}</th><th>${esc(T('th.backed_up'))}</th>
+      <th>${esc(T('th.last_backup'))}</th><th>${esc(T('th.ops'))}</th>
+    </tr></thead>
     <tbody>${cards.map(c => `
       <tr>
         <td>${esc(c.alias)}</td>
         <td>${c.enabled
-          ? (c.connected ? '<span class="chip ok">在线</span>' : '<span class="chip muted">未连接</span>')
-          : '<span class="chip warn">已停用</span>'}</td>
-        <td>${fmtBytes(c.bytes)} · ${(c.files || 0).toLocaleString()} 个</td>
+          ? (c.connected ? `<span class="chip ok">${esc(T('chip.online'))}</span>` : `<span class="chip muted">${esc(T('chip.offline'))}</span>`)
+          : `<span class="chip warn">${esc(T('chip.disabled'))}</span>`}</td>
+        <td>${fmtBytes(c.bytes)} · ${esc(T('files.count', { n: fmtNum(c.files || 0) }))}</td>
         <td>${fmtTime(c.last_backup_at)}</td>
-        <td><button class="btn sm ghost" data-action="backup-now" data-id="${esc(c.id)}" ${c.connected && c.enabled ? '' : 'disabled'}>立即备份</button></td>
+        <td><button class="btn sm ghost" data-action="backup-now" data-id="${esc(c.id)}" ${c.connected && c.enabled ? '' : 'disabled'}>${esc(T('btn.backup'))}</button></td>
       </tr>`).join('')}
-    </tbody></table>`;
+    </tbody></table></div>`;
   tab.innerHTML = `
-    <table><thead><tr>
-      <th>卡片</th><th>目标目录</th><th>整理方式</th><th>状态</th><th>已备份</th><th>最近备份</th><th>操作</th>
-    </tr></thead><tbody>${cards.map(c => cardRow(c)).join('')}</tbody></table>`;
+    <div class="table-wrap"><table><thead><tr>
+      <th>${esc(T('th.card'))}</th><th>${esc(T('th.target'))}</th><th>${esc(T('th.organize'))}</th>
+      <th>${esc(T('th.status'))}</th><th>${esc(T('th.backed_up'))}</th><th>${esc(T('th.last_backup'))}</th>
+      <th>${esc(T('th.ops'))}</th>
+    </tr></thead><tbody>${cards.map(c => cardRow(c)).join('')}</tbody></table></div>`;
 }
 
 function renderTasks(el, limit) {
-  if (!el) return;
-  if (!SNAP) return;
+  if (!el || !SNAP) return;
   const tasks = (SNAP.recent_tasks || []).slice(0, limit);
   const current = SNAP.current;
   let rows = tasks.map(t => {
@@ -275,30 +312,34 @@ function renderTasks(el, limit) {
     const totalFiles = isRunning ? current.total_files : t.total_files;
     const doneBytes = isRunning ? current.done_bytes : t.done_bytes;
     const errCount = isRunning ? current.error_count : (t.error_count || 0);
-    const result = isRunning ? (current.phase + '…') : (t.error || t.result || '—');
+    const result = isRunning
+      ? (trMsg(current.phase) + '…')
+      : (t.error || t.result ? trMsg(t.error || t.result) : '—');
     return `
       <tr>
         <td class="mono">#${t.id}</td>
         <td>${esc(t.card_alias || '')}</td>
-        <td>${esc(t.trigger || '')}</td>
+        <td>${esc(trMsg(t.trigger || ''))}</td>
         <td>${isRunning ? chip('running') : chip(t.status, errCount)}</td>
         <td>${fmtTime(t.started_at)}</td>
         <td>${fmtDur(t.started_at, t.finished_at)}</td>
         <td>${doneFiles || 0} / ${totalFiles || 0}<div class="sub-line">${fmtBytes(doneBytes)}</div></td>
         <td class="result-text">${esc(result)}</td>
         <td><div class="row-actions">
-          ${isRunning ? `<button class="btn sm danger" data-action="cancel-task" data-id="${t.id}">取消</button>` : ''}
+          ${isRunning ? `<button class="btn sm danger" data-action="cancel-task" data-id="${t.id}">${esc(T('btn.cancel'))}</button>` : ''}
           ${!isRunning && (t.status === 'failed' || t.status === 'interrupted' || errCount > 0)
-            ? `<button class="btn sm ghost" data-action="retry-task" data-id="${t.id}">重试</button>` : ''}
-          ${!isRunning && errCount > 0 ? `<button class="btn sm ghost" data-action="task-errors" data-id="${t.id}">错误详情</button>` : ''}
+            ? `<button class="btn sm ghost" data-action="retry-task" data-id="${t.id}">${esc(T('btn.retry'))}</button>` : ''}
+          ${!isRunning && errCount > 0 ? `<button class="btn sm ghost" data-action="task-errors" data-id="${t.id}">${esc(T('btn.errors'))}</button>` : ''}
         </div></td>
       </tr>`;
   }).join('');
   el.innerHTML = tasks.length
-    ? `<table><thead><tr>
-        <th>任务</th><th>卡片</th><th>触发</th><th>状态</th><th>开始时间</th><th>耗时</th><th>文件 / 数据</th><th>结果</th><th>操作</th>
-      </tr></thead><tbody>${rows}</tbody></table>`
-    : '<div class="empty">暂无任务记录。</div>';
+    ? `<div class="table-wrap"><table><thead><tr>
+        <th>${esc(T('th.task'))}</th><th>${esc(T('th.card'))}</th><th>${esc(T('th.trigger'))}</th>
+        <th>${esc(T('th.status'))}</th><th>${esc(T('th.started'))}</th><th>${esc(T('th.duration'))}</th>
+        <th>${esc(T('th.files'))}</th><th>${esc(T('th.result'))}</th><th>${esc(T('th.action'))}</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<div class="empty">${esc(T('empty.tasks'))}</div>`;
 }
 
 function renderSettings() {
@@ -310,6 +351,8 @@ function renderSettings() {
   $('#s-auto_unmount').checked = !!s.auto_unmount;
   $('#s-auto_accept').checked = !!s.auto_accept;
   $('#s-notify_url').value = s.notify_url || '';
+  const nl = $('#s-notify_lang');
+  if (nl) nl.value = s.notify_lang === 'en' ? 'en' : 'zh';
 }
 
 /* ────────────────────────── 弹窗 ────────────────────────── */
@@ -324,41 +367,50 @@ function openCardModal(card, deviceCardId) {
   const isEdit = !!card;
   const c = card || { alias: '', dest_subdir: '', organize: 'date', enabled: true, all_files: false, include_globs: '', exclude_globs: '' };
   openModal(`
-    <h3>${isEdit ? '编辑存储卡：' + esc(c.alias) : '注册存储卡'}</h3>
+    <h3>${esc(isEdit ? T('modal.edit', { alias: c.alias }) : T('modal.register'))}</h3>
     <div class="form-grid">
-      <label>卡片别名（用于生成备份目录名）
-        <input type="text" id="m-alias" value="${esc(c.alias)}" placeholder="例如：佳能R6 / DJI-Action">
+      <label>
+        <span>${esc(T('modal.alias'))}</span>
+        <input type="text" id="m-alias" value="${esc(c.alias)}" placeholder="${esc(T('modal.alias_ph'))}">
       </label>
-      <label>目标子目录（备份至 /backup/ 下的哪个文件夹）
-        <input type="text" id="m-dest" value="${esc(c.dest_subdir)}" placeholder="留空则用别名">
+      <label>
+        <span>${esc(T('modal.dest'))}</span>
+        <input type="text" id="m-dest" value="${esc(c.dest_subdir)}" placeholder="${esc(T('modal.dest_ph'))}">
       </label>
-      <label>目录整理方式
+      <label>
+        <span>${esc(T('modal.organize'))}</span>
         <select id="m-organize">
-          <option value="date" ${c.organize !== 'mirror' ? 'selected' : ''}>按拍摄日期（2024/01/15/IMG_0001.JPG）</option>
-          <option value="mirror" ${c.organize === 'mirror' ? 'selected' : ''}>保留卡内原结构（DCIM/100CANON/IMG_0001.JPG）</option>
+          <option value="date" ${c.organize !== 'mirror' ? 'selected' : ''}>${esc(T('modal.organize_date'))}</option>
+          <option value="mirror" ${c.organize === 'mirror' ? 'selected' : ''}>${esc(T('modal.organize_mirror'))}</option>
         </select>
       </label>
-      <label class="switch-line">启用（插入时自动备份）
+      <label class="switch-line">
+        <span>${esc(T('modal.enabled'))}</span>
         <span class="switch"><input type="checkbox" id="m-enabled" ${c.enabled ? 'checked' : ''}><i></i></span>
       </label>
-      <label class="switch-line">备份全部文件（默认只备份照片和视频）
+      <label class="switch-line">
+        <span>${esc(T('modal.allfiles'))}</span>
         <span class="switch"><input type="checkbox" id="m-allfiles" ${c.all_files ? 'checked' : ''}><i></i></span>
       </label>
-      <label>包含规则（可选，分号分隔的文件通配符，如 DCIM/*;*.jpg）
+      <label>
+        <span>${esc(T('modal.include'))}</span>
         <input type="text" id="m-include" value="${esc(c.include_globs || '')}">
       </label>
-      <label>排除规则（可选，如 *.LRV;*_thumb*）
+      <label>
+        <span>${esc(T('modal.exclude'))}</span>
         <input type="text" id="m-exclude" value="${esc(c.exclude_globs || '')}">
       </label>
     </div>
     <div class="foot">
-      <button class="btn ghost" data-action="modal-close">取消</button>
-      <button class="btn" data-action="modal-save" ${deviceCardId ? `data-dev="${esc(deviceCardId)}"` : ''} ${isEdit ? `data-edit="${esc(c.id)}"` : ''}>保存</button>
+      <button class="btn ghost" data-action="modal-close">${esc(T('modal.cancel'))}</button>
+      <button class="btn" data-action="modal-save" ${deviceCardId ? `data-dev="${esc(deviceCardId)}"` : ''} ${isEdit ? `data-edit="${esc(c.id)}"` : ''}>${esc(T('modal.save'))}</button>
     </div>`);
 }
 
 /* ────────────────────────── 动作 ────────────────────────── */
 document.addEventListener('click', async e => {
+  const langBtn = e.target.closest('.lang-btn');
+  if (langBtn) { setLang(langBtn.dataset.lang); return; }
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   const { action, id } = btn.dataset;
@@ -368,15 +420,15 @@ document.addEventListener('click', async e => {
       toast(r.message, 'info');
     } else if (action === 'diagnose') {
       const info = await api('/api/diagnose');
-      openModal(`<h3>运行环境自检</h3>
-        <p class="hint">检测不到卡时，把以下内容完整复制（鼠标全选 / Ctrl+A → Ctrl+C）发给维护者，即可定位问题。</p>
-        <pre style="white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5;background:#0d1014;border:1px solid #262c36;border-radius:8px;padding:10px;max-height:52vh;overflow:auto">${esc(JSON.stringify(info, null, 2))}</pre>
-        <div class="foot"><button class="btn ghost" data-action="modal-close">关闭</button></div>`);
+      openModal(`<h3>${esc(T('diag.title'))}</h3>
+        <p class="hint">${esc(T('diag.hint'))}</p>
+        <pre class="diag-pre">${esc(JSON.stringify(info, null, 2))}</pre>
+        <div class="foot"><button class="btn ghost" data-action="modal-close">${esc(T('modal.close'))}</button></div>`);
     } else if (action === 'register-dev') {
       const dev = (SNAP.devices || []).find(d => d.card_id === id);
       openCardModal(null, id);
       if (dev) {
-        $('#m-alias').value = dev.label || dev.display.split(' · ')[0] || '存储卡';
+        $('#m-alias').value = dev.label || dev.display.split(' · ')[0] || 'SD Card';
       }
     } else if (action === 'edit-card') {
       const c = (SNAP.cards || []).find(x => x.id === id);
@@ -394,14 +446,14 @@ document.addEventListener('click', async e => {
         include_globs: $('#m-include').value.trim(),
         exclude_globs: $('#m-exclude').value.trim(),
       };
-      if (!body.alias) { toast('请填写卡片别名', 'err'); return; }
+      if (!body.alias) { toast(T('toast.alias_required'), 'err'); return; }
       if (edit) {
         await api('/api/cards/' + encodeURIComponent(edit), { method: 'PATCH', body: JSON.stringify(body) });
-        toast('已保存');
+        toast(T('toast.saved'));
       } else {
         body.card_id = dev;
         const r = await api('/api/cards', { method: 'POST', body: JSON.stringify(body) });
-        toast(r.message || '已注册');
+        toast(r.message || T('toast.saved'));
       }
       closeModal();
     } else if (action === 'backup-now') {
@@ -417,24 +469,24 @@ document.addEventListener('click', async e => {
       const c = (SNAP.cards || []).find(x => x.id === id);
       if (c) {
         await api('/api/cards/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ enabled: !c.enabled }) });
-        toast(c.enabled ? '已停用（插入时不再自动备份）' : '已启用');
+        toast(T(c.enabled ? 'toast.disabled' : 'toast.enabled'));
       }
     } else if (action === 'reset-index') {
-      if (!confirm('清除该卡的增量索引？\n\n下次插入时会重新逐文件比对（不会删除或覆盖已备份的文件），耗时较长。')) return;
+      if (!confirm(T('confirm.reset_index'))) return;
       const r = await api('/api/cards/' + encodeURIComponent(id) + '/reset-index', { method: 'POST' });
       toast(r.message, 'info');
     } else if (action === 'del-card') {
-      if (!confirm('移除这张卡的注册记录？\n\n已备份的文件会保留在磁盘上；再次插入该卡将不再自动备份。')) return;
+      if (!confirm(T('confirm.del_card'))) return;
       const r = await api('/api/cards/' + encodeURIComponent(id), { method: 'DELETE' });
       toast(r.message, 'info');
     } else if (action === 'task-errors') {
       const t = await api('/api/tasks/' + id);
       const rows = (t.errors || []).map(x =>
-        `<tr><td class="mono">${esc(x.relpath)}</td><td>${esc(x.message)}</td></tr>`).join('');
-      openModal(`<h3>任务 #${t.id} 错误详情</h3>
-        ${rows ? `<table><thead><tr><th>文件</th><th>错误</th></tr></thead><tbody>${rows}</tbody></table>`
-               : '<div class="empty">没有记录到错误明细。</div>'}
-        <div class="foot"><button class="btn ghost" data-action="modal-close">关闭</button></div>`);
+        `<tr><td class="mono">${esc(x.relpath)}</td><td>${esc(trMsg(x.message))}</td></tr>`).join('');
+      openModal(`<h3>${esc(T('errors.title', { id: t.id }))}</h3>
+        ${rows ? `<div class="table-wrap"><table><thead><tr><th>${esc(T('th.file'))}</th><th>${esc(T('th.error'))}</th></tr></thead><tbody>${rows}</tbody></table></div>`
+               : `<div class="empty">${esc(T('empty.errors'))}</div>`}
+        <div class="foot"><button class="btn ghost" data-action="modal-close">${esc(T('modal.close'))}</button></div>`);
     } else if (action === 'eject-card') {
       const r = await api('/api/cards/' + encodeURIComponent(id) + '/unmount', { method: 'POST' });
       toast(r.message, 'info');
@@ -444,12 +496,33 @@ document.addEventListener('click', async e => {
   }
 });
 
+/* ────────────────────────── 语言 ────────────────────────── */
+function updateLangButtons() {
+  const cur = getLang();
+  document.querySelectorAll('.lang-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.lang === cur);
+  });
+}
+
+window.onLangChanged = () => {
+  updateLangButtons();
+  renderConn();
+  if (SNAP) render();
+  const st = $('#settings-status');
+  if (st && st.dataset.state === 'dirty') st.textContent = T('set.dirty');
+};
+
 /* 设置表单 */
 document.addEventListener('DOMContentLoaded', () => {
+  applyStaticI18n();
+  updateLangButtons();
+
   const form = $('#settings-form');
   form.addEventListener('input', () => {
     settingsDirty = true;
-    $('#settings-status').textContent = '有未保存的修改';
+    const st = $('#settings-status');
+    st.dataset.state = 'dirty';
+    st.textContent = T('set.dirty');
   });
   form.addEventListener('submit', async e => {
     e.preventDefault();
@@ -461,11 +534,14 @@ document.addEventListener('DOMContentLoaded', () => {
         auto_unmount: $('#s-auto_unmount').checked,
         auto_accept: $('#s-auto_accept').checked,
         notify_url: $('#s-notify_url').value.trim(),
+        notify_lang: $('#s-notify_lang').value,
       };
       await api('/api/settings', { method: 'PUT', body: JSON.stringify(body) });
       settingsDirty = false;
-      $('#settings-status').textContent = '已保存 ' + fmtTime(Date.now() / 1000);
-      toast('设置已保存');
+      const st = $('#settings-status');
+      st.dataset.state = 'saved';
+      st.textContent = T('set.saved_at', { t: fmtTime(Date.now() / 1000) });
+      toast(T('toast.settings_saved'));
     } catch (err) {
       toast(err.message || String(err), 'err');
     }

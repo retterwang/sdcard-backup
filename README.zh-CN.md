@@ -16,7 +16,9 @@
 | 安全只读 | 存储卡一律**只读挂载**，程序不向卡内写入或删除任何内容 |
 | 图形界面 | 实时进度条 / 设备列表 / 白名单管理 / 任务历史 / 错误明细 / 运行设置 |
 | 目录整理 | 按拍摄日期（2024/01/15/…）或保留卡内原结构，逐卡可配 |
-| 完成通知 | Webhook 自动适配 PushPlus / 企业微信机器人 / Server 酱 / 钉钉 |
+| 完成通知 | Webhook 自动适配 PushPlus / 企业微信机器人 / Server 酱 / 钉钉；通知语言可单独选择中文或 English |
+| 中英双语界面 | 顶栏一键切换中文 / English，界面文案与任务结果实时切换，选择记在浏览器本地 |
+| 手机端自适应 | 桌面、平板、手机自适应布局，手机浏览器即可查看进度、注册卡片与调整设置 |
 | 断点与重试 | 失败任务一键重试；目标空间不足自动预检中止 |
 
 ## 工作原理
@@ -104,7 +106,7 @@ sudo docker compose up -d --build
 | 推送服务 | 填写内容 | 获取方式 |
 |---|---|---|
 | **PushPlus**（微信） | `https://www.pushplus.plus/send?token=你的Token` | pushplus.plus 微信扫码登录 →「一对一推送」页复制 token |
-| **mails.dev**（邮箱·无需服务器） | `https://api.mails.dev/v1/send?key=mk_你的Key&to=收件邮箱` | mails.dev 申领邮箱后复制 API Key；免费 100 封/月 |
+| **邮件 API**（邮箱·无需服务器） | `https://api.<服务域名>/v1/send?key=你的Key&to=收件邮箱` | 由所用邮件 API 服务提供 Key 与发送地址 |
 | **SMTP 直发**（邮箱·无需服务器） | `smtp+ssl://发件邮箱:密码@SMTP服务器:465` | 例如企业邮自发：`smtp+ssl://you@example.com:客户端专用密码@smtp.exmail.qq.com:465`（默认收件人=发件人；密码含 `@` `#` `:` 需 URL 编码为 `%40` `%23` `%3A`） |
 | 企业微信机器人 | 群机器人 Webhook 完整地址 | 群设置 → 群机器人 → 添加并复制 |
 | Server 酱 | `https://sctapi.ftqq.com/你的SendKey.send` | sct.ftqq.com 登录后复制 SendKey |
@@ -113,7 +115,18 @@ sudo docker compose up -d --build
 
 > 通知发送失败不影响备份本身；失败原因记录在 `docker logs sdcard-backup`（关键字「通知发送失败」）。
 
-### 6. 常见问题排查
+### 6. 界面语言与完成通知语言
+
+| 项目 | 说明 |
+|---|---|
+| 界面语言 | 顶栏「中 / EN」一键切换，界面文案、任务状态与失败原因立即切换；选择保存在浏览器本地 |
+| 通知语言 | 「设置 → 完成通知语言」独立选择中文或 English，与浏览器界面语言无关（通知发给谁，就用谁看得懂的语言） |
+| 手机端 | 界面自适应手机分辨率，手机上可直接查看进度、注册卡片与修改设置 |
+
+一次语言切换会同时作用于：导航与按钮、状态徽章、任务结果与失败原因、错误详情。
+切换语言只改变文案，**不影响任何备份行为**。
+
+### 7. 常见问题排查
 
 | 现象 | 处理 |
 |---|---|
@@ -127,14 +140,14 @@ sudo docker compose up -d --build
 | 拔卡中断会不会丢数据 | 不会。已备份文件在索引里，重插后只补差集 |
 | 系统弹出"检测到外部设备" | 可忽略（那是 NAS 自身的挂载提示） |
 
-### 7. 运维要点
+### 8. 运维要点
 
 - `./data` 卷保存索引库与配置，**请不要删除**；丢了不会丢备份文件，只是下次插入需全量比对
 - 查看运行日志：`sudo docker logs -f sdcard-backup`
 - 升级：更新代码后 `sudo docker compose up -d --build`
 - 备份策略建议：NAS 上的备份 ≠ 最终备份，重要照片建议再异地保存一份
 
-### 8. 安全说明
+### 9. 安全说明
 
 - 容器需要 `privileged: true`，仅用于执行 `mount/umount` 只读挂载与读取设备；程序不写卡、不删源
 - 管理界面仅供**局域网**使用，请勿做公网端口映射；如需远程访问请套反向代理并加认证
@@ -157,9 +170,11 @@ python -m app                    # Linux 上可完整体验（Windows 无 lsblk�
 │   ├── mounter.py     # 只读挂载与回退策略
 │   ├── backup.py      # 增量备份引擎（计划/复制/校验）
 │   ├── runner.py      # 任务队列、状态机、通知
+│   ├── i18n.py        # 中英双语文案表与翻译（后端消息、任务结果、通知）
+│   ├── notify.py      # 完成通知渠道适配（PushPlus / 邮件 / SMTP / 企微 / 钉钉 / Server 酱）
 │   ├── web.py         # FastAPI REST + SSE
 │   ├── __main__.py    # 启动入口
-│   └── static/        # 管理界面（index.html / app.js / style.css）
+│   └── static/        # 管理界面（index.html / i18n.js / app.js / style.css）
 ├── tests/test_core.py # 核心逻辑测试
 ├── scripts/           # 构建导出脚本
 ├── Dockerfile

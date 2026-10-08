@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 APP_NAME = "存储卡备份控制台"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # 数据目录：SQLite 索引库、配置（必须持久化——增量判断依赖它）
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -31,4 +31,5 @@ DEFAULT_SETTINGS = {
     "auto_unmount": True,    # 备份完成后自动卸载（可安全拔卡）
     "auto_accept": False,    # 是否自动接受未注册的卡；False = 只备份白名单内的卡
     "notify_url": "",        # 任务完成/失败时的 Webhook 通知地址（可选）
+    "notify_lang": "zh",     # 完成通知的语言（zh / en），与浏览器界面语言无关
 }

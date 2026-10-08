@@ -15,7 +15,9 @@ A Docker container you can deploy on your NAS: **insert a storage card and your 
 | Strictly read-only | Storage cards are always mounted **read-only**; the program never writes to or deletes anything on the card |
 | Web UI | Live progress bars / device list / whitelist management / task history / error details / runtime settings |
 | Folder organization | Organize by capture date (2024/01/15/…) or keep the card's original structure — configurable per card |
-| Completion notifications | Webhook auto-detects PushPlus / WeCom (WeChat Work) group bot / ServerChan / DingTalk |
+| Completion notifications | Webhook auto-detects PushPlus / WeCom (WeChat Work) group bot / ServerChan / DingTalk; notification language (Chinese or English) is configurable |
+| Bilingual UI | Switch Chinese / English from the top bar; interface text and task results follow instantly, and the choice is remembered in the browser |
+| Mobile friendly | Adaptive layout for desktop, tablet and phone — check progress, register cards and change settings from a phone |
 | Resume & retry | One-click retry for failed tasks; the destination free-space check aborts early when there is not enough room |
 
 ## How it works
@@ -106,7 +108,7 @@ finishes or fails. The service type is detected automatically from the URL:
 | Push service | What to enter | How to obtain it |
 |---|---|---|
 | **PushPlus** (WeChat) | `https://www.pushplus.plus/send?token=YOUR_TOKEN` | Sign in to pushplus.plus with WeChat, then copy the token from the "One-to-one push" page |
-| **mails.dev** (email, no server required) | `https://api.mails.dev/v1/send?key=mk_YOUR_KEY&to=RECIPIENT` | Claim a mailbox on mails.dev and copy the API key; 100 free emails per month |
+| **Mail API** (email, no server required) | `https://api.<service-host>/v1/send?key=YOUR_KEY&to=RECIPIENT` | Provided by your mail API service (key and endpoint) |
 | **Direct SMTP** (email, no server required) | `smtp+ssl://SENDER:PASSWORD@SMTP_HOST:465` | For example, from a corporate mailbox: `smtp+ssl://you@example.com:app-password@smtp.exmail.qq.com:465` (the recipient defaults to the sender; passwords containing `@`, `#` or `:` must be URL-encoded as `%40`, `%23`, `%3A`) |
 | WeCom group bot | The full group-bot webhook URL | Group settings → Group bot → Add, then copy |
 | ServerChan | `https://sctapi.ftqq.com/YOUR_SENDKEY.send` | Sign in at sct.ftqq.com and copy the SendKey |
@@ -116,7 +118,18 @@ finishes or fails. The service type is detected automatically from the URL:
 > A failed notification never affects the backup itself; the reason is logged in `docker logs sdcard-backup`
 > (search for "通知发送失败").
 
-### 6. Troubleshooting
+### 6. UI language and notification language
+
+| Item | Description |
+|---|---|
+| UI language | Switch with the "中 / EN" toggle in the top bar. Interface text, task states and failure reasons change immediately; the choice is stored in the browser |
+| Notification language | Pick Chinese or English under "Settings → Notification language". It is independent of the browser UI language, so the message matches whoever receives it |
+| Mobile | The UI adapts to phone resolutions — check progress, register cards and change settings from a phone |
+
+A single switch covers navigation and buttons, status chips, task results and failure reasons, and error details.
+Switching only changes wording; **backup behaviour is unaffected**.
+
+### 7. Troubleshooting
 
 | Symptom | Action |
 |---|---|
@@ -130,7 +143,7 @@ finishes or fails. The service type is detected automatically from the URL:
 | Will removing a card mid-run lose data? | No. Already-copied files are recorded in the index, so only the difference is transferred after re-insertion |
 | The system pops up "external device detected" | Safe to ignore — that is the NAS's own mount notification |
 
-### 7. Operations notes
+### 8. Operations notes
 
 - The `./data` volume holds the index database and configuration. **Do not delete it**; losing it does not lose backup
   files, but the next insertion will require a full comparison
@@ -138,7 +151,7 @@ finishes or fails. The service type is detected automatically from the URL:
 - Upgrade: update the code, then `sudo docker compose up -d --build`
 - Backup strategy advice: a copy on the NAS is not a final backup. Keep an off-site copy of important photos
 
-### 8. Security notes
+### 9. Security notes
 
 - The container requires `privileged: true`, used only to perform read-only `mount`/`umount` and read device information.
   The program never writes to the card and never deletes the source
@@ -163,9 +176,11 @@ python -m app                    # Full experience on Linux (Windows has no lsbl
 │   ├── mounter.py     # Read-only mounting and fallback strategies
 │   ├── backup.py      # Incremental backup engine (planning / copying / verification)
 │   ├── runner.py      # Task queue, state machine, notifications
+│   ├── i18n.py        # Chinese/English message tables (backend messages, task results, notifications)
+│   ├── notify.py      # Notification channel adapters (PushPlus / mail / SMTP / WeCom / DingTalk / ServerChan)
 │   ├── web.py         # FastAPI REST + SSE
 │   ├── __main__.py    # Entry point
-│   └── static/        # Web UI (index.html / app.js / style.css)
+│   └── static/        # Web UI (index.html / i18n.js / app.js / style.css)
 ├── tests/test_core.py # Core logic tests
 ├── scripts/           # Build and export scripts
 ├── Dockerfile

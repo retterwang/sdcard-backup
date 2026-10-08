@@ -135,7 +135,7 @@ def _is_removable(disk: dict, realpath=os.path.realpath, sysfs=_read_sys):
     rm = bool(disk.get("rm"))
     if name.startswith("mmcblk"):
         # mmcblk 可能是「SD 卡槽（可移动）」也可能是「内置 eMMC 系统盘（不可移动，
-        # 如绿联 NAS 的 mmcblk0）」，必须用 removable 标记 + device/type 精确区分，
+        # 如多数 NAS 的 mmcblk0 系统盘）」，必须用 removable 标记 + device/type 精确区分，
         # 否则会把系统盘误报为存储卡。
         typ = sysfs("/sys/block/%s/device/type" % name).strip().upper()
         if rm or typ == "SD":
@@ -195,7 +195,7 @@ class Device:
 
     @property
     def display(self) -> str:
-        bits = [self.label or self.model or self.reader_serial or "存储卡"]
+        bits = [self.label or self.model or self.reader_serial or "SD Card"]
         bits.append(self.fstype or "?")
         bits.append(media.fmt_bytes(self.size))
         return " · ".join(bits)

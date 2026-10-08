@@ -8,6 +8,8 @@
 - 绝不覆盖目标侧已有内容：同名不同内容时自动加 __2/__3 后缀；
 - 校验默认开启：复制完成后重读目标文件比对哈希，防止拷贝静默损坏；
 - 目标空间不足时启动前预检，避免写一半失败。
+
+任务阶段（phase）与失败原因统一使用 i18n 消息键，由界面按当前语言渲染。
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import stat
 import time
 from dataclasses import dataclass
 
-from . import media
+from . import i18n, media
 
 CHUNK = 1 << 20  # 1 MiB
 
@@ -134,7 +136,7 @@ def _verify(path: str, expect_hash: str):
                 break
             h.update(buf)
     if h.hexdigest() != expect_hash:
-        raise OSError("校验失败：目标文件哈希与源文件不一致")
+        raise OSError(i18n.pack("err.verify_failed"))
 
 
 def copy_one(item: Item, dest_root: str, task_id: int, verify: bool, ctx) -> dict:
@@ -198,10 +200,10 @@ def copy_one(item: Item, dest_root: str, task_id: int, verify: bool, ctx) -> dic
 # ── 主流程 ────────────────────────────────────────────────
 def run_backup(db, card: dict, src_root: str, dest_root: str, ctx, verify: bool = True) -> dict:
     """对一张卡执行一次增量备份。"""
-    ctx.set_phase("扫描文件")
+    ctx.set_phase("phase.scanning")
     files = list(iter_files(src_root))
 
-    ctx.set_phase("比对索引")
+    ctx.set_phase("phase.comparing")
     index = db.file_index(card["id"])
     items, skipped, skipped_bytes, planned_bytes = build_plan(files, index, card)
     ctx.set_plan(len(items), planned_bytes)
@@ -212,12 +214,13 @@ def run_backup(db, card: dict, src_root: str, dest_root: str, ctx, verify: bool 
         except OSError:
             free = None
         if free is not None and planned_bytes > free * 0.99:
-            raise OSError(
-                f"目标存储空间不足：需要 {media.fmt_bytes(planned_bytes)}，"
-                f"剩余 {media.fmt_bytes(free)}"
-            )
+            raise OSError(i18n.pack(
+                "err.space_low",
+                need=media.fmt_bytes(planned_bytes),
+                free=media.fmt_bytes(free),
+            ))
 
-    ctx.set_phase("备份中")
+    ctx.set_phase("phase.copying")
     copied = reused = error_count = 0
     errors, pending = [], []
 
@@ -246,7 +249,7 @@ def run_backup(db, card: dict, src_root: str, dest_root: str, ctx, verify: bool 
                 # 设备读取类错误（拔出/IO 故障）→ 直接终止任务，避免逐文件报错
                 if e.errno in (errno.ENODEV, errno.ENXIO, errno.EIO) or \
                         "input/output error" in str(e).lower():
-                    raise OSError("存储卡读取中断（可能已被拔出）")
+                    raise OSError(i18n.pack("err.read_interrupted"))
                 error_count += 1
                 msg = str(e)
                 if len(errors) < 200:
@@ -254,7 +257,7 @@ def run_backup(db, card: dict, src_root: str, dest_root: str, ctx, verify: bool 
                     db.task_error_add(ctx.task_id, it.rel, msg)
                 ctx.file_failed(it, msg)
                 if "no space left" in msg.lower() or "空间不足" in msg:
-                    raise OSError("目标存储空间不足，任务已终止")
+                    raise OSError(i18n.pack("err.space_full"))
             except Exception as e:
                 error_count += 1
                 msg = str(e)

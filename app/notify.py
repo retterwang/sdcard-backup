@@ -2,7 +2,7 @@
 
 支持（按地址/协议自动识别）：
 - PushPlus            https://www.pushplus.plus/send?token=你的Token
-- mails.dev（邮箱）    https://api.mails.dev/v1/send?key=mk_...&to=收件邮箱[&from=发件邮箱]
+- 邮件 API 服务        https://api.<服务域名>/v1/send?key=...&to=收件邮箱[&from=发件邮箱]
 - SMTP 直发（邮箱）     smtp+ssl://发件邮箱:密码@SMTP服务器:465[?to=收件邮箱]
                        密码含特殊字符需 URL 编码（@→%40  #→%23  :→%3A）
 - 企业微信机器人       https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
@@ -22,15 +22,20 @@ from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formatdate
 
+from . import i18n
+
 log = logging.getLogger("notify")
 
-# Cloudflare 会拦截默认的 Python-urllib User-Agent（error 1010），
-# mails.dev 等走 Cloudflare 的服务必须带浏览器 UA。
+# 部分服务走 Cloudflare，会拦截默认的 Python-urllib User-Agent（error 1010），
+# 因此统一带浏览器 UA。
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
+# 邮件 API 服务的域名特征（按此识别适配分支；不对外宣传具体服务商）
+MAIL_API_HOST_MARKERS = ("mails.dev",)
 
-def build_request(url: str, title: str, content: str):
+
+def build_request(url: str, title: str, content: str, lang: str = i18n.DEFAULT_LANG):
     """生成 HTTP 请求参数：(最终URL, 请求体 bytes, Content-Type, 额外请求头)。纯函数，便于测试。"""
     u = urllib.parse.urlparse(url)
     host = (u.hostname or "").lower()
@@ -39,25 +44,19 @@ def build_request(url: str, title: str, content: str):
     if "pushplus" in host:
         token = (urllib.parse.parse_qs(u.query).get("token") or [""])[0]
         if not token:
-            raise ValueError(
-                "PushPlus 地址缺少 token 参数"
-                "（应形如 https://www.pushplus.plus/send?token=你的Token）"
-            )
+            raise ValueError(i18n.t("notify.err.pushplus_token", lang))
         body = {"token": token, "title": title, "content": content, "template": "txt"}
         return url, json.dumps(body, ensure_ascii=False).encode("utf-8"), \
             "application/json; charset=utf-8", {}
 
-    if "mails.dev" in host:
+    if any(m in host for m in MAIL_API_HOST_MARKERS):
         q = urllib.parse.parse_qs(u.query)
         key = (q.get("key") or [""])[0]
         to = (q.get("to") or [""])[0]
         if not key:
-            raise ValueError(
-                "mails.dev 地址缺少 key 参数"
-                "（应形如 https://api.mails.dev/v1/send?key=mk_...&to=收件邮箱）"
-            )
+            raise ValueError(i18n.t("notify.err.mails_key", lang))
         if not to:
-            raise ValueError("mails.dev 地址缺少 to 参数（收件邮箱）")
+            raise ValueError(i18n.t("notify.err.mails_to", lang))
         body = {"to": [to], "subject": title, "text": content}
         frm = (q.get("from") or [""])[0]
         if frm:
@@ -81,7 +80,7 @@ def build_request(url: str, title: str, content: str):
         "application/json; charset=utf-8", {}
 
 
-def parse_smtp_url(url: str) -> dict:
+def parse_smtp_url(url: str, lang: str = i18n.DEFAULT_LANG) -> dict:
     """解析 smtp+ssl:// 直发地址。
 
     格式：smtp+ssl://发件邮箱:密码@SMTP服务器:465[?to=收件邮箱&from=发件邮箱]
@@ -89,7 +88,7 @@ def parse_smtp_url(url: str) -> dict:
     """
     u = urllib.parse.urlparse(url)
     if u.scheme not in ("smtp+ssl", "smtp"):
-        raise ValueError("不是 SMTP 直发地址")
+        raise ValueError(i18n.t("notify.err.smtp_scheme", lang))
     host = u.hostname or ""
     user = urllib.parse.unquote(u.username or "")
     password = urllib.parse.unquote(u.password or "")
@@ -98,16 +97,13 @@ def parse_smtp_url(url: str) -> dict:
     frm = (q.get("from") or [""])[0] or user
     port = u.port or 465
     if not (host and user and password and to):
-        raise ValueError(
-            "SMTP 地址不完整（需要 发件邮箱:密码@SMTP服务器:端口，"
-            "密码含 @ # : 请编码为 %40 %23 %3A）"
-        )
+        raise ValueError(i18n.t("notify.err.smtp_incomplete", lang))
     return {"host": host, "port": port, "user": user,
             "password": password, "to": to, "from": frm}
 
 
-def send_smtp(url: str, title: str, content: str):
-    p = parse_smtp_url(url)
+def send_smtp(url: str, title: str, content: str, lang: str = i18n.DEFAULT_LANG):
+    p = parse_smtp_url(url, lang)
     msg = MIMEText(content, "plain", "utf-8")
     msg["Subject"] = Header(title, "utf-8")
     msg["From"] = p["from"]
@@ -118,16 +114,17 @@ def send_smtp(url: str, title: str, content: str):
         s.sendmail(p["from"], [p["to"]], msg.as_string())
 
 
-def send(url: str, title: str, content: str, timeout: int = 10):
+def send(url: str, title: str, content: str, timeout: int = 10,
+         lang: str = i18n.DEFAULT_LANG):
     """发送通知，返回 (是否成功, 结果或错误信息)。"""
     if url.startswith(("smtp+ssl://", "smtp://")):
         try:
-            send_smtp(url, title, content)
-            return True, "SMTP 已发送"
+            send_smtp(url, title, content, lang)
+            return True, i18n.t("notify.sent_smtp", lang)
         except Exception as e:
             return False, str(e)
     try:
-        final_url, data, ctype, headers = build_request(url, title, content)
+        final_url, data, ctype, headers = build_request(url, title, content, lang)
     except ValueError as e:
         return False, str(e)
     try:

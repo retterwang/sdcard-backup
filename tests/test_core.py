@@ -145,7 +145,7 @@ def test_detector():
     devs6 = detector.build_devices(sample_emmc, sysfs=_sd_sysfs,
                                    probe=lambda n, s=0: {}, realpath=lambda p: "")
     ok(len(devs6) == 1, f"device/type=SD 的 mmcblk 应可识别: {devs6}")
-    print("  [1/6] 设备解析与卡片识别  ✓")
+    print("  [1/7] 设备解析与卡片识别  ✓")
 
 
 def test_media():
@@ -171,7 +171,7 @@ def test_media():
     ok(media.is_media("a.JPG") and media.is_media("b.insv") and not media.is_media("readme.txt"),
        "媒体类型识别异常")
     ok(media.is_junk("MVI_0001.THM") and not media.is_junk("MVI_0001.MP4"), "垃圾伴随文件识别异常")
-    print("  [2/6] 日期推断与媒体识别  ✓")
+    print("  [2/7] 日期推断与媒体识别  ✓")
 
 
 def test_path_safety():
@@ -184,7 +184,7 @@ def test_path_safety():
        "分隔符未清洗")
     ok(media.slug_subdir("") == "card", "空别名应回退 card")
     ok(media.fmt_bytes(1536) == "1.5 KB", f"fmt_bytes 异常: {media.fmt_bytes(1536)}")
-    print("  [3/6] 路径安全与格式化  ✓")
+    print("  [3/7] 路径安全与格式化  ✓")
 
 
 def test_plan():
@@ -219,7 +219,7 @@ def test_plan():
     card4 = dict(card, exclude_globs="*.MP4")
     items4, _, _, _ = backup.build_plan(files, index, card4)
     ok(all(not x.rel.endswith(".MP4") for x in items4), "exclude 规则过滤异常")
-    print("  [4/6] 增量计划与过滤规则  ✓")
+    print("  [4/7] 增量计划与过滤规则  ✓")
 
 
 def test_copy():
@@ -273,7 +273,7 @@ def test_copy():
             ok(False, "错误哈希未被检出")
         except OSError:
             ok(True, "")
-    print("  [5/6] 复制、冲突与校验  ✓")
+    print("  [5/7] 复制、冲突与校验  ✓")
 
 
 def test_notify():
@@ -350,7 +350,45 @@ def test_notify():
     # 通用回退：JSON {title, text}
     _, data, _, _ = notify.build_request("https://example.com/hook", "标题", "内容")
     ok(json.loads(data.decode("utf-8")) == {"title": "标题", "text": "内容"}, "通用载荷异常")
-    print("  [6/6] 通知载荷适配  ✓")
+    print("  [6/7] 通知载荷适配  ✓")
+
+
+def test_i18n():
+    """界面语言：语言解析、翻译、落库消息渲染（兼容历史纯文本）。"""
+    from app import i18n
+
+    # 语言归一化与优先级：?lang= > Accept-Language > 默认中文
+    ok(i18n.normalize_lang("en-US") == "en" and i18n.normalize_lang("zh_CN") == "zh",
+       "语言标签归一化异常")
+    ok(i18n.normalize_lang("fr") == "zh", "未知语言应回落到中文")
+    ok(i18n.from_request("en", "zh-CN,zh;q=0.9") == "en", "?lang 应优先于请求头")
+    ok(i18n.from_request(None, "en-GB,en;q=0.8") == "en", "Accept-Language 解析异常")
+    ok(i18n.from_request(None, None) == "zh", "缺少语言信息时应默认中文")
+
+    # 翻译与参数插值
+    ok(i18n.t("status.done", "zh") == "完成" and i18n.t("status.done", "en") == "Done",
+       "状态翻译异常")
+    ok(i18n.t("err.space_low", "en", need="2 GB", free="1 GB")
+       == "Not enough space at the destination: need 2 GB, free 1 GB", "带参数翻译异常")
+    ok(i18n.t("no.such.key", "zh") == "no.such.key", "未知键应原样返回")
+
+    # 落库消息（键 + 参数）按语言渲染
+    stored = i18n.pack("err.card_removed")
+    ok(i18n.render_stored(stored, "zh") == "存储卡已拔出", "落库消息中文渲染异常")
+    ok(i18n.render_stored(stored, "en") == "Storage card removed", "落库消息英文渲染异常")
+
+    # 结果摘要两种语言的拼接
+    s = i18n.pack("task.summary", copied=3, bytes="12.0 MB", reused=1,
+                  skipped=5, failed=0, empty=False, nonew=False)
+    zh, en = i18n.render_stored(s, "zh"), i18n.render_stored(s, "en")
+    ok("新增 3 个（12.0 MB）" in zh and "索引跳过 5 个" in zh, f"中文摘要异常: {zh}")
+    ok("3 new (12.0 MB)" in en and "5 skipped by index" in en, f"英文摘要异常: {en}")
+
+    # 历史纯文本（老数据）原样返回，不受语言影响
+    ok(i18n.render_stored("新增 2 个（1.0 MB）", "en") == "新增 2 个（1.0 MB）",
+       "历史纯文本应原样返回")
+    ok(i18n.render_stored("", "en") == "", "空消息渲染异常")
+    print("  [7/7] 界面语言与消息渲染  ✓")
 
 
 def main():
@@ -361,6 +399,7 @@ def main():
     test_plan()
     test_copy()
     test_notify()
+    test_i18n()
     print(f"\n全部通过：{PASSED} 项断言 ✓")
 
 
