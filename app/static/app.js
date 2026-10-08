@@ -12,7 +12,8 @@ let USERS = [];             // 用户列表（仅管理员加载）
 let settingsDirty = false;
 let prevCurrentTaskId = null;
 let connOk = null;
-let lastSnapKey = null;
+// 分区去重 Key：各区块独立比对，只重绘真正变化的部分（避免整页重建的闪烁）
+const SNAP_KEYS = {};
 
 /* ────────────────────────── 工具 ────────────────────────── */
 function esc(s) {
@@ -111,30 +112,44 @@ function connect() {
     let snap;
     try { snap = JSON.parse(ev.data); } catch (e) { return; }
     SNAP = snap;
-    // 快照未变化时跳过重绘：避免每秒重建 DOM 造成的闪烁与点击落空
-    const key = snapKey(snap);
-    if (key === lastSnapKey) return;
-    lastSnapKey = key;
-    render();
+    renderChanged(snap);
   };
   ES.onerror = () => setConn(false);
 }
 
-function snapKey(snap) {
-  const c = Object.assign({}, snap);
-  delete c.now;               // 时间戳每秒都变，不参与比较
-  return JSON.stringify(c);
+/* 分区比对：只重绘内容真正变化的区块 */
+function renderChanged(snap) {
+  const changed = (name, val) => {
+    const k = JSON.stringify(val === undefined ? null : val);
+    if (SNAP_KEYS[name] === k) return false;
+    SNAP_KEYS[name] = k;
+    return true;
+  };
+  const any = (...vals) => vals;
+  if (changed('hero', snap.current)) renderHero();
+  if (changed('stats', any(snap.cards, snap.devices))) renderStats();
+  if (changed('devices', snap.devices)) renderDevices();
+  if (changed('cards', snap.cards)) renderCards();
+  if (changed('tasks', any(snap.recent_tasks, snap.current))) {
+    renderTasks($('#dash-tasks'), 5);
+    renderTasks($('#tasks-full'), 50);
+  }
+  if (changed('resumable', snap.resumable)) renderResumable();
+  if (changed('settings', snap.settings)) renderSettings();
 }
 
 /* ────────────────────────── 渲染 ────────────────────────── */
 function render() {
+  Object.keys(SNAP_KEYS).forEach(k => delete SNAP_KEYS[k]);
   renderHero();
   renderStats();
   renderDevices();
   renderCards();
   renderTasks($('#dash-tasks'), 5);
   renderTasks($('#tasks-full'), 50);
+  renderResumable();
   renderSettings();
+  if (SNAP) renderChanged(SNAP);
 }
 
 function renderHero() {
@@ -326,6 +341,11 @@ function renderTasks(el, limit) {
     const result = isRunning
       ? (trMsg(current.phase) + '…')
       : (t.error || t.result ? trMsg(t.error || t.result) : '—');
+    const avg = isRunning ? (current.speed || 0) : (t.avg_speed || 0);
+    const peak = t.peak_speed || 0;
+    const speedLine = avg
+      ? `<div class="sub-line">⚡ ${fmtBytes(avg)}/s${peak && peak >= avg ? ` · ${esc(T('task.peak'))} ${fmtBytes(peak)}/s` : ''}</div>`
+      : '';
     return `
       <tr>
         <td class="mono">#${t.id}</td>
@@ -334,7 +354,7 @@ function renderTasks(el, limit) {
         <td>${isRunning ? chip('running') : chip(t.status, errCount)}</td>
         <td>${fmtTime(t.started_at)}</td>
         <td>${fmtDur(t.started_at, t.finished_at)}</td>
-        <td>${doneFiles || 0} / ${totalFiles || 0}<div class="sub-line">${fmtBytes(doneBytes)}</div></td>
+        <td>${doneFiles || 0} / ${totalFiles || 0}<div class="sub-line">${fmtBytes(doneBytes)}</div>${speedLine}</td>
         <td class="result-text">${esc(result)}</td>
         <td><div class="row-actions">
           ${isRunning ? `<button class="btn sm danger" data-action="cancel-task" data-id="${t.id}">${esc(T('btn.cancel'))}</button>` : ''}
@@ -362,8 +382,68 @@ function renderSettings() {
   $('#s-auto_unmount').checked = !!s.auto_unmount;
   $('#s-auto_accept').checked = !!s.auto_accept;
   $('#s-notify_url').value = s.notify_url || '';
+  const cw = $('#s-copy_workers');
+  if (cw) cw.value = s.copy_workers || 2;
+  const ad = $('#s-adaptive_scan');
+  if (ad) ad.checked = s.adaptive_scan !== false;
   const nl = $('#s-notify_lang');
   if (nl) nl.value = s.notify_lang === 'en' ? 'en' : 'zh';
+}
+
+/* 上次中断的任务：提示重新插入存储卡即可续传 */
+function renderResumable() {
+  const el = $('#resumable-banner');
+  if (!el || !SNAP) return;
+  const rows = SNAP.resumable || [];
+  if (!rows.length) { el.hidden = true; el.innerHTML = ''; return; }
+  const t = rows[0];
+  el.hidden = false;
+  el.innerHTML = `
+    <div class="resume-box">
+      <div class="resume-text">
+        <b>${esc(T('resume.title'))}</b>
+        <span class="muted">${esc(T('resume.detail', {
+          alias: t.card_alias || '', files: t.done_files || 0, total: t.total_files || 0 }))}</span>
+      </div>
+      <div class="row-actions">
+        <button class="btn sm" data-action="retry-task" data-id="${t.id}">${esc(T('btn.retry'))}</button>
+      </div>
+    </div>`;
+}
+
+/* 通知发送记录（最近 20 条，独立于 SSE） */
+let NOTIFS = [];
+async function loadNotifications() {
+  const el = $('#notifications-list');
+  if (!el) return;
+  try {
+    const r = await api('/api/notifications?limit=20&lang=' + getLang());
+    NOTIFS = r.notifications || [];
+  } catch (err) {
+    NOTIFS = [];
+  }
+  renderNotifications();
+}
+
+function renderNotifications() {
+  const el = $('#notifications-list');
+  if (!el) return;
+  if (!NOTIFS.length) { el.innerHTML = `<div class="empty">${esc(T('empty.notifications'))}</div>`; return; }
+  const rows = NOTIFS.map(n => {
+    const sendCls = n.ok ? 'ok' : 'err';
+    return `<tr>
+      <td class="mono">#${n.task_id != null ? n.task_id : '—'}</td>
+      <td>${esc(n.card_alias || '')}</td>
+      <td>${chip(n.status || 'unknown')}</td>
+      <td>${chip(sendCls === 'ok' ? 'done' : 'failed')}<span class="sub-line">${esc(T(n.ok ? 'notify.sent' : 'notify.failed'))}</span></td>
+      <td>${fmtTime(n.at)}</td>
+      <td class="result-text">${esc(n.detail || '—')}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>${esc(T('th.task'))}</th><th>${esc(T('th.card'))}</th><th>${esc(T('th.status'))}</th>
+      <th>${esc(T('notify.col.send'))}</th><th>${esc(T('th.started'))}</th><th>${esc(T('th.result'))}</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 /* ────────────────────────── 账号与用户 ────────────────────────── */
@@ -514,7 +594,7 @@ function closeModal() { $('#modal-root').innerHTML = ''; }
 
 function openCardModal(card, deviceCardId) {
   const isEdit = !!card;
-  const c = card || { alias: '', dest_subdir: '', organize: 'date', enabled: true, all_files: false, include_globs: '', exclude_globs: '' };
+  const c = card || { alias: '', dest_subdir: '', organize: 'date', enabled: true, all_files: false, include_globs: '', exclude_globs: '', target_root: '' };
   openModal(`
     <h3>${esc(isEdit ? T('modal.edit', { alias: c.alias }) : T('modal.register'))}</h3>
     <div class="form-grid">
@@ -525,6 +605,11 @@ function openCardModal(card, deviceCardId) {
       <label>
         <span>${esc(T('modal.dest'))}</span>
         <input type="text" id="m-dest" value="${esc(c.dest_subdir)}" placeholder="${esc(T('modal.dest_ph'))}">
+      </label>
+      <label>
+        <span>${esc(T('modal.target_root'))}</span>
+        <input type="text" id="m-targetroot" value="${esc(c.target_root || '')}" placeholder="${esc(T('modal.target_root_ph'))}">
+        <small>${esc(T('modal.target_root_hint'))}</small>
       </label>
       <label>
         <span>${esc(T('modal.organize'))}</span>
@@ -594,6 +679,7 @@ document.addEventListener('click', async e => {
         all_files: $('#m-allfiles').checked,
         include_globs: $('#m-include').value.trim(),
         exclude_globs: $('#m-exclude').value.trim(),
+        target_root: ($('#m-targetroot') ? $('#m-targetroot').value.trim() : ''),
       };
       if (!body.alias) { toast(T('toast.alias_required'), 'err'); return; }
       if (edit) {
@@ -636,6 +722,9 @@ document.addEventListener('click', async e => {
         ${rows ? `<div class="table-wrap"><table><thead><tr><th>${esc(T('th.file'))}</th><th>${esc(T('th.error'))}</th></tr></thead><tbody>${rows}</tbody></table></div>`
                : `<div class="empty">${esc(T('empty.errors'))}</div>`}
         <div class="foot"><button class="btn ghost" data-action="modal-close">${esc(T('modal.close'))}</button></div>`);
+    } else if (action === 'refresh-notifications') {
+      await loadNotifications();
+      toast(T('toast.refreshed'), 'info');
     } else if (action === 'eject-card') {
       const r = await api('/api/cards/' + encodeURIComponent(id) + '/unmount', { method: 'POST' });
       toast(r.message, 'info');
@@ -725,6 +814,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const body = {
         scan_interval: parseInt($('#s-scan_interval').value, 10),
         mount_delay: parseInt($('#s-mount_delay').value, 10),
+        copy_workers: parseInt($('#s-copy_workers').value, 10) || 2,
+        adaptive_scan: $('#s-adaptive_scan').checked,
         verify: $('#s-verify').checked,
         auto_unmount: $('#s-auto_unmount').checked,
         auto_accept: $('#s-auto_accept').checked,
@@ -737,6 +828,7 @@ document.addEventListener('DOMContentLoaded', () => {
       st.dataset.state = 'saved';
       st.textContent = T('set.saved_at', { t: fmtTime(Date.now() / 1000) });
       toast(T('toast.settings_saved'));
+      loadNotifications();
     } catch (err) {
       toast(err.message || String(err), 'err');
     }
@@ -815,4 +907,5 @@ function switchTab(t) {
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   document.querySelectorAll('.tabpane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + t));
   if (t === 'users' && ME && ME.is_admin) loadUsers();
+  if (t === 'settings') loadNotifications();
 }

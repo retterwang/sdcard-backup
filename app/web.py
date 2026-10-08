@@ -29,6 +29,9 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # 无需登录即可访问的路径
 PUBLIC_PATHS = {"/login", "/api/auth/login", "/api/auth/state", "/api/health"}
 
+# OpenAPI 文档路径（仅 ENABLE_DOCS=1 时放行；默认关闭，最小化对外暴露面）
+DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+
 
 def _lang(request: Request) -> str:
     """解析请求语言：?lang= 优先，其次 Accept-Language。"""
@@ -63,6 +66,7 @@ class CardPayload(BaseModel):
     all_files: Optional[bool] = None
     include_globs: Optional[str] = None
     exclude_globs: Optional[str] = None
+    target_root: Optional[str] = None  # 该卡单独的备份根目录（留空 = 全局 BACKUP_ROOT）
     note: Optional[str] = None
 
 
@@ -74,6 +78,8 @@ class SettingsPayload(BaseModel):
     auto_accept: Optional[bool] = None
     notify_url: Optional[str] = None
     notify_lang: Optional[str] = None
+    copy_workers: Optional[int] = None
+    adaptive_scan: Optional[bool] = None
 
 
 class LoginPayload(BaseModel):
@@ -97,7 +103,14 @@ class UserPayload(BaseModel):
 
 
 def create_app(db, state, runner) -> FastAPI:
-    app = FastAPI(title="SD Card Backup Console", version=config.VERSION)
+    app = FastAPI(
+        title="SD Card Backup Console",
+        version=config.VERSION,
+        # OpenAPI 文档默认关闭（最小暴露面）；调试时用 ENABLE_DOCS=1 打开
+        docs_url="/docs" if config.ENABLE_DOCS else None,
+        redoc_url="/redoc" if config.ENABLE_DOCS else None,
+        openapi_url="/openapi.json" if config.ENABLE_DOCS else None,
+    )
 
     def cur_user(request: Request):
         """当前登录用户（认证中间件已注入；理论上不会为空）。"""
@@ -114,11 +127,15 @@ def create_app(db, state, runner) -> FastAPI:
             max_age=config.SESSION_TTL, httponly=True, samesite="lax", path="/",
         )
 
+    allow_docs = config.ENABLE_DOCS
+
     @app.middleware("http")
     async def auth_gate(request: Request, call_next):
         """登录校验：未登录重定向（页面）或 401（接口）；首登未改密时只放行账号接口。"""
         p = request.url.path
         if p in PUBLIC_PATHS or p.startswith("/static/") or p == "/favicon.ico":
+            return await call_next(request)
+        if allow_docs and p in DOCS_PATHS:
             return await call_next(request)
         lang = _lang(request)
         user = auth.current_user(db, request.cookies.get(config.SESSION_COOKIE))
@@ -311,6 +328,7 @@ def create_app(db, state, runner) -> FastAPI:
             "all_files": bool(p.all_files),
             "include_globs": (p.include_globs or "").strip(),
             "exclude_globs": (p.exclude_globs or "").strip(),
+            "target_root": (p.target_root or "").strip(),
             "note": p.note or "",
         }
         if dev:
@@ -350,11 +368,12 @@ def create_app(db, state, runner) -> FastAPI:
             v = getattr(p, k)
             if v is not None:
                 patch[k] = bool(v)
-        for k in ("include_globs", "exclude_globs", "note"):
+        for k in ("include_globs", "exclude_globs", "note", "target_root"):
             v = getattr(p, k)
             if v is not None:
                 patch[k] = v.strip()
         card = db.card_update(cid, patch)
+        state.invalidate()
         return {"ok": True, "card": card}
 
     @app.delete("/api/cards/{cid}")
@@ -395,6 +414,17 @@ def create_app(db, state, runner) -> FastAPI:
         lang = _lang(request)
         limit = max(1, min(limit, 200))
         rows = db.tasks_recent(limit)
+        for r in rows:
+            r["result"] = i18n.render_stored(r.get("result"), lang)
+            r["error"] = i18n.render_stored(r.get("error"), lang)
+            r["phase"] = i18n.render_stored(r.get("phase"), lang)
+        return {"tasks": rows}
+
+    # 注意：静态路径必须注册在 /api/tasks/{tid} 之前，否则会被参数路由截获
+    @app.get("/api/tasks/interrupted")
+    async def tasks_interrupted(request: Request):
+        lang = _lang(request)
+        rows = db.task_resumable()
         for r in rows:
             r["result"] = i18n.render_stored(r.get("result"), lang)
             r["error"] = i18n.render_stored(r.get("error"), lang)
@@ -466,8 +496,25 @@ def create_app(db, state, runner) -> FastAPI:
             if v not in i18n.LANGS:
                 raise HTTPException(400, i18n.t("web.notify_lang_invalid", lang))
             patch["notify_lang"] = v
+        if p.copy_workers is not None:
+            if not 1 <= p.copy_workers <= 8:
+                raise HTTPException(400, i18n.t("web.copy_workers_range", lang))
+            patch["copy_workers"] = int(p.copy_workers)
+        if p.adaptive_scan is not None:
+            patch["adaptive_scan"] = bool(p.adaptive_scan)
         if patch:
             db.settings_set_many(patch)
+            state.invalidate()
         return {"ok": True, "settings": db.settings_all()}
+
+    # ── 通知历史 ──
+    @app.get("/api/notifications")
+    async def notifications_list(request: Request, limit: int = 20):
+        lang = _lang(request)
+        limit = max(1, min(limit, 100))
+        rows = db.notifications_recent(limit)
+        for r in rows:
+            r["status_text"] = runner.status_text(r.get("status") or "", lang)
+        return {"notifications": rows}
 
     return app

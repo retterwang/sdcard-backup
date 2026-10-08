@@ -39,6 +39,8 @@
     <div class="hero-idle"><div class="big" data-i18n="hero.connecting">正在连接后端…</div></div>
   </section>
 
+  <section id="resumable-banner" class="resumable-banner" hidden></section>
+
   <section id="stats" class="stats"></section>
 
   <nav class="tabs" role="tablist">
@@ -93,10 +95,20 @@
           <input type="number" id="s-scan_interval" min="1" max="120" step="1">
           <small data-i18n="set.scan_interval_hint">检测插卡/拔卡的轮询频率，1-120 秒。</small>
         </label>
+        <label class="switch-line">
+          <span data-i18n="set.adaptive_scan">自动降低空闲时的扫描频率（省电）</span>
+          <span class="switch"><input type="checkbox" id="s-adaptive_scan"><i></i></span>
+          <small data-i18n="set.adaptive_scan_hint">无设备变化时逐步延长扫描间隔（最长约 15 秒），检测到插拔后立即恢复高频扫描。</small>
+        </label>
         <label>
           <span data-i18n="set.mount_delay">插卡后等待时间（秒）</span>
           <input type="number" id="s-mount_delay" min="0" max="300" step="1">
           <small data-i18n="set.mount_delay_hint">识别到卡后等待若干秒再挂载，避免系统识别未完成，0-300 秒。</small>
+        </label>
+        <label>
+          <span data-i18n="set.copy_workers">并行复制线程数</span>
+          <input type="number" id="s-copy_workers" min="1" max="8" step="1">
+          <small data-i18n="set.copy_workers_hint">同时复制的文件数，1-8。机械硬盘/低速卡建议 1-2，SSD 或 NVMe 目标盘可调高。</small>
         </label>
         <label class="switch-line">
           <span data-i18n="set.verify">复制完成后校验哈希（推荐）</span>
@@ -131,6 +143,14 @@
           <span id="settings-status" class="muted"></span>
         </div>
       </form>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h2 data-i18n="sec.notifications">通知发送记录</h2>
+        <button class="btn sm ghost" data-action="refresh-notifications" data-i18n="btn.refresh">刷新</button>
+      </div>
+      <p class="hint" data-i18n="hint.notifications">最近 20 条完成通知的发送结果。通知失败不会影响备份任务，仅在此处留痕便于排查。</p>
+      <div id="notifications-list"></div>
     </div>
     <div class="card">
       <h2 data-i18n="sec.about">关于本程序</h2>

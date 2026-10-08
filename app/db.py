@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS cards (
     created_at REAL,
     last_seen_at REAL,
     last_backup_at REAL,
-    note TEXT DEFAULT ''
+    note TEXT DEFAULT '',
+    target_root TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS files (
     card_id TEXT NOT NULL,
@@ -96,16 +97,37 @@ CREATE TABLE IF NOT EXISTS sessions (
     ip TEXT DEFAULT '',
     ua TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS login_attempts (
+    ip TEXT NOT NULL,
+    ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    card_alias TEXT,
+    status TEXT DEFAULT '',
+    ok INTEGER NOT NULL DEFAULT 0,
+    detail TEXT DEFAULT '',
+    at REAL
+);
 CREATE INDEX IF NOT EXISTS idx_files_card ON files(card_id);
 CREATE INDEX IF NOT EXISTS idx_errors_task ON task_errors(task_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_login_ip ON login_attempts(ip, ts);
 """
+
+# 兼容旧库的增量迁移（ALTER TABLE 在列已存在时会报错，逐条容错）
+MIGRATIONS = (
+    "ALTER TABLE cards ADD COLUMN target_root TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN avg_speed REAL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN peak_speed REAL DEFAULT 0",
+)
 
 # PATCH 接口允许修改的卡片字段
 CARD_PATCHABLE = {
     "alias", "dest_subdir", "organize", "enabled", "all_files",
-    "include_globs", "exclude_globs", "note",
+    "include_globs", "exclude_globs", "note", "target_root",
 }
 
 
@@ -136,6 +158,11 @@ class DB:
         with self._lock:
             c = self._conn()
             c.executescript(SCHEMA)
+            for sql in MIGRATIONS:
+                try:
+                    c.execute(sql)
+                except sqlite3.OperationalError:
+                    pass          # 列已存在（新库或已迁移）
             c.commit()
 
     def execute(self, sql, args=()):
@@ -213,8 +240,8 @@ class DB:
         self.execute(
             """INSERT INTO cards(id,alias,dest_subdir,organize,enabled,all_files,
                include_globs,exclude_globs,fs_uuid,fs_label,fs_type,reader_serial,
-               card_size,created_at,last_seen_at,note)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               card_size,created_at,last_seen_at,note,target_root)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 d["id"], d["alias"], d["dest_subdir"], d.get("organize", "date"),
                 1 if d.get("enabled", True) else 0,
@@ -222,7 +249,7 @@ class DB:
                 d.get("include_globs", ""), d.get("exclude_globs", ""),
                 d.get("fs_uuid", ""), d.get("fs_label", ""), d.get("fs_type", ""),
                 d.get("reader_serial", ""), int(d.get("card_size") or 0),
-                now, now, d.get("note", ""),
+                now, now, d.get("note", ""), (d.get("target_root") or "").strip(),
             ),
         )
         return self.card_get(d["id"])
@@ -291,6 +318,49 @@ class DB:
         )
         return (int(r["n"]), int(r["b"])) if r else (0, 0)
 
+    def card_stats_all(self) -> dict:
+        """一次查询取回全部卡片的 (文件数, 字节数)。
+
+        避免 snapshot() 对每张卡各发一次 COUNT/SUM 的 N+1 查询。
+        返回 {card_id: (files, bytes)}。
+        """
+        rows = self.query(
+            "SELECT card_id, COUNT(*) n, COALESCE(SUM(size),0) b FROM files "
+            "WHERE status='done' GROUP BY card_id"
+        )
+        return {r["card_id"]: (int(r["n"]), int(r["b"])) for r in rows}
+
+    def cards_lookup(self, ids_lists: list) -> dict:
+        """批量按候选 ID 列表查找卡片，避免逐设备多次单条查询。
+
+        ids_lists: [[card_id, 'fs:uuid', ...], ...]（每个设备的候选 ID）
+        返回 {设备的候选 ID 元组下标: card}，键为该设备在入参中的索引。
+        卡片匹配优先级与 card_lookup 一致：按候选顺序取第一个命中。
+        """
+        want = {}
+        for idx, ids in enumerate(ids_lists):
+            for i in ids:
+                if i:
+                    want.setdefault(i, idx)
+        if not want:
+            return {}
+        out: dict = {}
+        # SQLite 参数上限约 999，分批查询
+        keys = list(want)
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for r in self.query(f"SELECT * FROM cards WHERE id IN ({ph})", chunk):
+                out[r["id"]] = r
+        # 按每个设备自身的候选顺序取第一个命中
+        result = {}
+        for idx, ids in enumerate(ids_lists):
+            for i in ids:
+                if i and i in out:
+                    result[idx] = out[i]
+                    break
+        return result
+
     def card_reset_index(self, card_id: str):
         with self._lock:
             c = self._conn()
@@ -341,6 +411,55 @@ class DB:
                 c.execute("DELETE FROM task_errors WHERE task_id < ?", (r["m"],))
                 c.execute("DELETE FROM tasks WHERE id < ?", (r["m"],))
                 c.commit()
+
+    def task_interrupted_mark(self) -> int:
+        """把上次进程退出时仍处于 running 的任务标记为 interrupted。
+
+        用于重启后清理"僵尸任务"——运行态任务不可能跨进程存活。
+        返回被标记的记录数。
+        """
+        rows = self.query("SELECT id FROM tasks WHERE status='running'")
+        if not rows:
+            return 0
+        now = time.time()
+        with self._lock:
+            c = self._conn()
+            c.execute(
+                "UPDATE tasks SET status='interrupted', finished_at=?, "
+                "phase=? WHERE status='running'",
+                (now, json.dumps({"k": "status.interrupted", "p": {}},
+                                 ensure_ascii=False, separators=(",", ":"))),
+            )
+            c.commit()
+        return len(rows)
+
+    def task_resumable(self) -> list:
+        """可恢复的任务：被中断、且该卡仍存在（供界面提示「断点续传」）。"""
+        return self.query(
+            "SELECT * FROM tasks WHERE status='interrupted' "
+            "ORDER BY id DESC LIMIT 20"
+        )
+
+    # ── 通知历史 ──────────────────────────────────────────
+    def notify_add(self, task_id, alias: str, status: str, ok: bool, detail: str):
+        self.execute(
+            "INSERT INTO notifications(task_id,card_alias,status,ok,detail,at) "
+            "VALUES(?,?,?,?,?,?)",
+            (task_id, alias, status, 1 if ok else 0, (detail or "")[:500], time.time()),
+        )
+
+    def notifications_recent(self, limit: int = 20) -> list:
+        return self.query(
+            "SELECT * FROM notifications ORDER BY id DESC LIMIT ?", (limit,)
+        )
+
+    def notifications_cleanup(self, keep: int = 100):
+        r = self.query_one(
+            "SELECT MIN(id) m FROM (SELECT id FROM notifications ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
+        if r and r["m"]:
+            self.execute("DELETE FROM notifications WHERE id < ?", (r["m"],))
 
     # ── 用户 ──────────────────────────────────────────────
     def users_all(self) -> list:
@@ -421,3 +540,29 @@ class DB:
 
     def sessions_purge(self, now: float = None):
         self.execute("DELETE FROM sessions WHERE expires_at < ?", (now or time.time(),))
+
+    # ── 登录限速（落库，重启不清零） ──────────────────────
+    def login_failures(self, ip: str, since: float) -> list:
+        """返回该 IP 在 since 之后的失败时间戳（升序）。"""
+        if not ip:
+            return []
+        return [
+            float(r["ts"]) for r in self.query(
+                "SELECT ts FROM login_attempts WHERE ip=? AND ts>=? ORDER BY ts",
+                (ip, since),
+            )
+        ]
+
+    def login_failure_add(self, ip: str, ts: float = None):
+        if not ip:
+            return
+        self.execute("INSERT INTO login_attempts(ip,ts) VALUES(?,?)",
+                     (ip, ts or time.time()))
+
+    def login_failures_clear(self, ip: str):
+        if not ip:
+            return
+        self.execute("DELETE FROM login_attempts WHERE ip=?", (ip,))
+
+    def login_failures_purge(self, before: float):
+        self.execute("DELETE FROM login_attempts WHERE ts < ?", (before,))

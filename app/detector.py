@@ -394,16 +394,29 @@ def diagnose() -> dict:
 
 
 class Detector(threading.Thread):
-    """后台轮询线程：对比前后两次扫描结果，触发 新增/移除 回调。"""
+    """后台轮询线程：对比前后两次扫描结果，触发 新增/移除 回调。
 
-    def __init__(self, on_add, on_remove, interval_provider):
+    自适应间隔（adaptive）：空闲且设备集合稳定时逐步退避到最长
+    ``max(interval, IDLE_MAX)``；一旦设备集合发生变化，立即以基础间隔高频复查
+    若干轮（HOT_ROUNDS），避免"插卡后系统还在枚举分区"的中间态被误判。
+    这样既省电、少 IO，又保证插卡响应及时。
+    """
+
+    IDLE_MAX = 15.0       # 空闲时的最长间隔（秒）
+    HOT_ROUNDS = 5        # 变化后的高频复查轮数
+    HOT_INTERVAL = 1.0    # 变化后的复查间隔（秒）
+
+    def __init__(self, on_add, on_remove, interval_provider, adaptive_provider=None):
         super().__init__(daemon=True, name="detector")
         self._on_add = on_add
         self._on_remove = on_remove
         self._interval_provider = interval_provider  # 返回秒数（读数据库设置）
+        self._adaptive_provider = adaptive_provider or (lambda: True)
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._last_summary = None
+        self._idle_rounds = 0        # 连续未变化的轮数（用于退避）
+        self._hot_rounds = 0         # 剩余高频复查轮数
         self.devices: dict = {}   # card_id -> Device（当前在线的设备）
 
     # 供外部读取当前状态
@@ -413,8 +426,9 @@ class Detector(threading.Thread):
     def run(self):
         missing_logged = False
         while not self._stop.is_set():
+            changed = False
             try:
-                self._scan_once()
+                changed = self._scan_once()
                 missing_logged = False
             except FileNotFoundError:
                 if not missing_logged:  # 非 Linux 开发环境：只提示一次
@@ -423,20 +437,41 @@ class Detector(threading.Thread):
             except Exception as e:  # 单次扫描失败不影响循环
                 log.warning("设备扫描失败: %s", e)
             try:
-                interval = max(1.0, float(self._interval_provider() or 3))
+                base = max(1.0, float(self._interval_provider() or 3))
             except Exception:
-                interval = 3.0
-            self._wake.wait(interval)
+                base = 3.0
+            self._wake.wait(self._next_interval(base, changed))
             self._wake.clear()
 
+    def _next_interval(self, base: float, changed: bool) -> float:
+        if not self._adaptive():
+            return base
+        if changed:
+            self._idle_rounds = 0
+            self._hot_rounds = self.HOT_ROUNDS
+        if self._hot_rounds > 0:
+            self._hot_rounds -= 1
+            return min(base, self.HOT_INTERVAL)
+        self._idle_rounds += 1
+        # 每空闲一轮把间隔乘 1.5 倍，上限 IDLE_MAX（但不小于用户设置的基础值）
+        grown = base * (1.5 ** min(self._idle_rounds, 8))
+        return max(base, min(grown, max(base, self.IDLE_MAX)))
+
+    def _adaptive(self) -> bool:
+        try:
+            return bool(self._adaptive_provider())
+        except Exception:
+            return True
+
     def rescan_now(self):
+        self._hot_rounds = self.HOT_ROUNDS    # 手动重扫后也进入高频复查
         self._wake.set()
 
     def stop(self):
         self._stop.set()
         self._wake.set()
 
-    def _scan_once(self):
+    def _scan_once(self) -> bool:
         devices, notes, raw = snapshot_with_notes()
 
         # 设备集合有变化（或首次扫描）时输出判定摘要，便于 docker logs 排查
@@ -480,3 +515,4 @@ class Detector(threading.Thread):
                 self._on_add(d)
             except Exception:
                 log.exception("on_add 回调异常")
+        return bool(added or removed)

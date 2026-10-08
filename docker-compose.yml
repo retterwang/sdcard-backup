@@ -46,3 +46,9 @@ services:
           propagation: rslave
       - ./data:/data              # 索引库/配置：必须持久化，切勿删除
       - /volume1/photo/SD卡备份:/backup   # ← 改成你的照片目标文件夹（绿联共享文件夹实际路径）
+    # 日志轮转：限制单文件大小与保留份数，避免长期运行撑爆磁盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -65,6 +65,8 @@ class TaskCtx:
         self.error_count = 0
         self.started_at = None
         self.rate = 0.0
+        self.peak_rate = 0.0
+        self.bytes_copied = 0
         self._t_last = None
         self._b_last = 0
 
@@ -95,13 +97,17 @@ class TaskCtx:
             self.total_files = n
             self.total_bytes = b
 
-    def add_bytes(self, n: int):
+    def add_bytes(self, n: int, copied: bool = True):
         with self.lock:
             self.done_bytes += n
+            if copied:
+                self.bytes_copied += n
             now = time.time()
             if self._t_last and now > self._t_last:
                 inst = (self.done_bytes - self._b_last) / (now - self._t_last)
                 self.rate = inst if self.rate <= 0 else self.rate * 0.7 + inst * 0.3
+                if self.rate > self.peak_rate:
+                    self.peak_rate = self.rate
             self._t_last = now
             self._b_last = self.done_bytes
 
@@ -117,6 +123,14 @@ class TaskCtx:
         with self.lock:
             self.error_count += 1
             self.done_files += 1
+
+    def speed_avg(self) -> float:
+        """整任务平均速度（字节/秒），用于落库与展示。"""
+        with self.lock:
+            if not self.started_at or not self.bytes_copied:
+                return 0.0
+            dur = time.time() - self.started_at
+            return round(self.bytes_copied / dur, 1) if dur > 0 else 0.0
 
     # ── 快照 ──
     def snapshot(self) -> dict:
@@ -151,6 +165,9 @@ class TaskCtx:
 class AppState:
     """全局共享状态。"""
 
+    # 快照缓存有效期（秒）：SSE 每秒轮询 + 多标签页并行时避免重复查询
+    SNAPSHOT_TTL = 0.5
+
     def __init__(self, db):
         self.db = db
         self.lock = threading.RLock()
@@ -158,14 +175,23 @@ class AppState:
         self.current = None       # TaskCtx | None
         self.queue: list = []     # [{"card_id","alias","trigger"}]
         self.last_result = None
+        self._snap_cache = None   # (ts, snap, dirty)
+        self._dirty = True        # 有写入动作时置位，强制下次重建
+
+    def invalidate(self):
+        """状态/数据发生变化时调用，下一次 snapshot() 立即重建（不吃缓存）。"""
+        with self.lock:
+            self._dirty = True
 
     def device_add(self, dev):
         with self.lock:
             self.devices[dev.card_id] = {"device": dev, "added_at": time.time()}
+            self._dirty = True
 
     def device_remove(self, card_id: str):
         with self.lock:
             self.devices.pop(card_id, None)
+            self._dirty = True
 
     def device_by_card(self, card: dict):
         with self.lock:
@@ -180,28 +206,51 @@ class AppState:
 
     # ── 生成给 Web/SSE 的快照 ──
     def snapshot(self) -> dict:
+        # 任务进行中时进度每秒都在变，不启用缓存（保证界面流畅）
         with self.lock:
-            devices = []
-            for info in self.devices.values():
-                dev = info["device"]
-                card = self.db.card_lookup(dev.id_candidates)
-                d = dev.to_dict()
-                d["registered"] = bool(card)
-                d["alias"] = card["alias"] if card else ""
-                d["enabled"] = bool(card["enabled"]) if card else False
-                devices.append(d)
+            running = self.current is not None
+            if not running and not self._dirty and self._snap_cache:
+                ts, snap = self._snap_cache
+                if time.time() - ts < self.SNAPSHOT_TTL:
+                    return snap
+        snap = self._build_snapshot()
+        with self.lock:
+            self._snap_cache = (time.time(), snap)
+            self._dirty = False
+        return snap
+
+    def _build_snapshot(self) -> dict:
+        with self.lock:
+            device_list = list(self.devices.values())
             current = self.current.snapshot() if self.current else None
             queue_info = list(self.queue)
 
+        # 单次批量查询替代逐设备的 card_lookup（N+1 → 1）
+        lookups = self.db.cards_lookup([info["device"].id_candidates
+                                        for info in device_list])
+        devices = []
+        for idx, info in enumerate(device_list):
+            dev = info["device"]
+            card = lookups.get(idx)
+            d = dev.to_dict()
+            d["registered"] = bool(card)
+            d["alias"] = card["alias"] if card else ""
+            d["enabled"] = bool(card["enabled"]) if card else False
+            devices.append(d)
+
+        # 单次批量统计替代逐卡 card_stats（N+1 → 1）
+        stats = self.db.card_stats_all()
+        connected_ids = {info["device"].card_id for info in device_list}
         cards = []
         for c in self.db.cards_all():
-            files, bytes_ = self.db.card_stats(c["id"])
-            connected = self.device_by_card(c) is not None
+            files, bytes_ = stats.get(c["id"], (0, 0))
+            connected = c["id"] in connected_ids or self.device_by_card(c) is not None
             cards.append({
                 "id": c["id"], "alias": c["alias"], "dest_subdir": c["dest_subdir"],
                 "organize": c["organize"], "enabled": bool(c["enabled"]),
                 "all_files": bool(c["all_files"]),
                 "include_globs": c["include_globs"], "exclude_globs": c["exclude_globs"],
+                "target_root": c.get("target_root") or "",
                 "fs_uuid": c["fs_uuid"], "fs_label": c["fs_label"],
                 "created_at": c["created_at"], "last_backup_at": c["last_backup_at"],
                 "files": files, "bytes": bytes_, "connected": connected,
@@ -229,6 +278,8 @@ class AppState:
             "queue": queue_info,
             "cards": cards,
             "recent_tasks": recent,
+            # 上次异常退出遗留的中断任务（界面可提示「重插续传」）
+            "resumable": [r for r in recent if r.get("status") == "interrupted"],
             "settings": self.db.settings_all(),
         }
 
@@ -242,11 +293,13 @@ class Runner:
             self.on_device_added,
             self.on_device_removed,
             interval_provider=lambda: self.db.setting_get("scan_interval", 3),
+            adaptive_provider=lambda: bool(self.db.setting_get("adaptive_scan", True)),
         )
         self.worker = threading.Thread(target=self._worker_loop, name="worker", daemon=True)
         self.kept_mounts: dict = {}   # device_id -> Mount（auto_unmount 关闭时保持的挂载）
 
     def start(self):
+        self.recover_interrupted()    # 先清理上次遗留的 running 僵尸任务
         self.detector.start()
         self.worker.start()
         log.info("检测与任务线程已启动")
@@ -281,6 +334,7 @@ class Runner:
             cur.cancel(i18n.pack("err.card_removed"))
         with self.state.lock:
             self.state.queue = [q for q in self.state.queue if q["card_id"] != dev.card_id]
+            self.state._dirty = True
 
     # ── 队列 ──
     def enqueue(self, dev, card: dict, trigger: str) -> bool:
@@ -295,6 +349,7 @@ class Runner:
             self.state.queue.append({
                 "card_id": card["id"], "alias": card["alias"], "trigger": trigger,
             })
+            self.state._dirty = True
         self.jobs.put({"device": dev, "card": card, "trigger": trigger})
         log.info("任务已入队: %s（%s）", card["alias"], trigger)
         return True
@@ -357,6 +412,33 @@ class Runner:
             n += 1
         return f"{base}-{n}"
 
+    def dest_root_for(self, card: dict) -> str:
+        """计算某张卡的备份根目录。
+
+        默认 = BACKUP_ROOT/<dest_subdir>；若卡片单独指定了 target_root
+        （用于把不同卡备份到不同磁盘/共享文件夹），则以其为准。
+        """
+        custom = (card.get("target_root") or "").strip()
+        if custom:
+            return custom
+        return os.path.join(config.BACKUP_ROOT, card["dest_subdir"])
+
+    def _copy_workers(self) -> int:
+        """复制线程数（1 = 串行）。异常/越界一律回落为串行。"""
+        try:
+            n = int(self.db.setting_get("copy_workers", 2) or 2)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, min(n, 8))
+
+    def recover_interrupted(self) -> int:
+        """启动时清理僵尸任务：把上次进程退出时残留的 running 记为 interrupted。"""
+        n = self.db.task_interrupted_mark()
+        if n:
+            log.warning("发现 %d 个上次未正常结束的任务，已标记为「已中断」"
+                        "（重新插入对应存储卡即可增量续传）", n)
+        return n
+
     # ── 工作线程 ──
     def _worker_loop(self):
         while True:
@@ -377,6 +459,7 @@ class Runner:
         with self.state.lock:
             self.state.current = ctx
             self.state.queue = [q for q in self.state.queue if q["card_id"] != card["id"]]
+            self.state._dirty = True
         ctx.started()
 
         mount = None
@@ -401,11 +484,13 @@ class Runner:
                 raise OSError(mount.error)
             log.info("挂载完成: %s -> %s (%s)", dev.node, mount.path, mount.mode)
 
-            dest_root = os.path.join(config.BACKUP_ROOT, card["dest_subdir"])
+            dest_root = self.dest_root_for(card)
             os.makedirs(dest_root, exist_ok=True)
             verify = bool(self.db.setting_get("verify", True))
 
-            res = backup.run_backup(self.db, card, mount.path, dest_root, ctx, verify=verify)
+            res = backup.run_backup(self.db, card, mount.path, dest_root, ctx,
+                                    verify=verify, workers=self._copy_workers(),
+                                    report=True)
             status = "done"
             result_line = self._summary(res)
             self.db.card_touch(card["id"], backup_done=True)
@@ -437,19 +522,23 @@ class Runner:
                     total_files=ctx.total_files, done_files=ctx.done_files,
                     total_bytes=ctx.total_bytes, done_bytes=ctx.done_bytes,
                     error_count=ctx.error_count, phase=status_key(status),
-                    result=result_line, error=error, **extra,
+                    result=result_line, error=error,
+                    avg_speed=ctx.speed_avg(), peak_speed=round(ctx.peak_rate, 1),
+                    **extra,
                 )
             except Exception:
                 log.exception("写入任务结果失败")
             with self.state.lock:
                 if self.state.current is ctx:
                     self.state.current = None
+                self.state._dirty = True
             self.state.last_result = {
                 "task_id": task_id, "status": status,
                 "result": result_line, "error": error,
             }
-            self._notify(card, status, result_line or error)
+            self._notify(card, status, result_line or error, task_id=task_id)
             self.db.tasks_cleanup()
+            self.db.notifications_cleanup()
             self.detector.rescan_now()
 
     @staticmethod
@@ -466,7 +555,7 @@ class Runner:
             nonew=(res["planned_files"] == 0 and res["skipped"] != 0),
         )
 
-    def _notify(self, card: dict, status: str, text: str):
+    def _notify(self, card: dict, status: str, text: str, task_id: int = None):
         url = self.db.setting_get("notify_url", "") or ""
         if not url.startswith(("http://", "https://", "smtp+ssl://", "smtp://")):
             return
@@ -487,3 +576,8 @@ class Runner:
             log.info("通知已发送: %s（%s）", title, msg)
         else:
             log.warning("通知发送失败: %s", msg)
+        # 通知结果落库（界面「通知历史」可查；失败也不影响任务本身）
+        try:
+            self.db.notify_add(task_id, card["alias"], status, ok, msg)
+        except Exception:
+            log.exception("写入通知历史失败")

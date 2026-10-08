@@ -132,6 +132,10 @@ MESSAGES: dict = {
         "zh": "通知语言仅支持 zh / en",
         "en": "Notification language only supports zh / en",
     },
+    "web.copy_workers_range": {
+        "zh": "并行复制线程数需在 1-8 之间",
+        "en": "Copy workers must be between 1 and 8",
+    },
 
     # 任务操作（Runner 返回给界面）
     "run.card_disabled": {"zh": "该卡已停用，请先启用", "en": "This card is disabled, enable it first"},

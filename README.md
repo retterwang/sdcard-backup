@@ -20,6 +20,12 @@ A Docker container you can deploy on your NAS: **insert a storage card and your 
 | Sign-in & accounts | Username/password sign-in with an HttpOnly session cookie. The initial administrator `admin` / `admin` must change its username and password on first sign-in; administrators can create, disable, delete accounts and reset passwords |
 | Mobile friendly | Adaptive layout for desktop, tablet and phone — check progress, register cards and change settings from a phone |
 | Resume & retry | One-click retry for failed tasks; the destination free-space check aborts early when there is not enough room |
+| Resumable copy | If a card is unplugged or power is lost, already-copied data is not repeated — re-inserting the same card continues from where it stopped (the partial chunk is kept on the destination) |
+| Parallel copying | A configurable number of copy workers (1-8) speeds things up noticeably on SSD/NVMe destinations; index writes stay serial for consistency |
+| Adaptive scanning | Lengthens the device scan interval automatically when idle (up to ~15s, can be turned off) and returns to frequent scanning the moment a card is inserted or removed |
+| Per-card backup root | Give a single card its own backup root so different cards can be backed up to different disks |
+| Notification history | The UI shows the delivery result of the last 20 completion notifications (a failure never affects the backup), making push issues easy to diagnose |
+| Speed metrics | Task records show average and peak speed to help gauge card and destination throughput |
 
 ## How it works
 

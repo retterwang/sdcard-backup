@@ -10,7 +10,8 @@
   ``must_change=1``；在修改用户名与密码之前，后端会拦截其余所有接口。
 - **用户管理**：支持增删、启停、重置密码；始终保证至少存在一个启用状态的管理员，
   且不允许删除/停用当前登录的账号。
-- **登录限速**：同一来源 IP 在 5 分钟内失败 8 次即暂时拒绝（进程内存态，重启即清空）。
+- **登录限速**：同一来源 IP 在 5 分钟内失败 8 次即暂时拒绝。失败记录写入
+  SQLite ``login_attempts`` 表（**重启不清零**，避免通过重启绕过限速）。
 
 所有失败原因返回 ``(消息键, 参数)``，由 Web 层按请求语言渲染。
 """
@@ -35,9 +36,10 @@ HASH_PREFIX = "pbkdf2_sha256"
 # 用户名允许：字母、数字、下划线、点、@、连字符，以及中日韩汉字（\w 在 Python3 已含汉字）
 USERNAME_RE = re.compile(r"^[\w.@\-]+$", re.UNICODE)
 
-# 登录限速（进程内存态）
+# 登录限速
 MAX_FAILS = 8
 FAIL_WINDOW = 300
+# 兼容旧调用：未提供 db 时的内存回退（仅测试或非 Web 场景使用）
 _fails: dict = {}
 _fails_lock = threading.Lock()
 
@@ -85,34 +87,59 @@ def check_password(password: str) -> Optional[tuple]:
 
 
 # ── 登录限速 ─────────────────────────────────────────────────
-def blocked_seconds(ip: str) -> int:
+# 失败记录以 SQLite 为准（重启不清零）；进程内维护一份内存镜像用于判定，
+# 首次见到某个 IP 时从 SQLite 恢复其历史，兼容两套调用签名：
+#   blocked_seconds(ip) / blocked_seconds(ip, db)
+def _mem_add(ip: str, ts: float):
+    with _fails_lock:
+        stamps = [t for t in _fails.get(ip, []) if ts - t < FAIL_WINDOW]
+        stamps.append(ts)
+        _fails[ip] = stamps
+
+
+def _mem_window(ip: str, now: float, db=None) -> list:
+    """取该 IP 的失败时间窗；内存为空时尝试从 SQLite 恢复（进程重启场景）。"""
+    with _fails_lock:
+        if ip not in _fails and db is not None:
+            try:
+                hist = db.login_failures(ip, now - FAIL_WINDOW)
+                if hist:
+                    _fails[ip] = hist
+            except Exception:
+                pass
+        stamps = [t for t in _fails.get(ip, []) if now - t < FAIL_WINDOW]
+        _fails[ip] = stamps
+        return list(stamps)
+
+
+def blocked_seconds(ip: str, db=None) -> int:
     """该 IP 是否被临时拒绝登录；返回剩余秒数（0 = 允许）。"""
     if not ip:
         return 0
     now = time.time()
-    with _fails_lock:
-        stamps = [t for t in _fails.get(ip, []) if now - t < FAIL_WINDOW]
-        _fails[ip] = stamps
-        if len(stamps) >= MAX_FAILS:
-            return int(FAIL_WINDOW - (now - stamps[0])) + 1
+    stamps = _mem_window(ip, now, db)
+    if len(stamps) >= MAX_FAILS:
+        return int(FAIL_WINDOW - (now - stamps[0])) + 1
     return 0
 
 
-def note_failure(ip: str):
+def note_failure(ip: str, db=None):
     if not ip:
         return
-    with _fails_lock:
-        now = time.time()
-        stamps = [t for t in _fails.get(ip, []) if now - t < FAIL_WINDOW]
-        stamps.append(now)
-        _fails[ip] = stamps
+    now = time.time()
+    _mem_add(ip, now)
+    if db is not None:
+        db.login_failure_add(ip, now)
+        db.login_failures_purge(now - FAIL_WINDOW * 4)   # 顺带清理过期记录
 
 
-def clear_failures(ip: str):
+def clear_failures(ip: str, db=None):
     if not ip:
         return
     with _fails_lock:
         _fails.pop(ip, None)
+    if db is not None:
+        db.login_failures_clear(ip)
 
 
 # ── 初始管理员 ───────────────────────────────────────────────
@@ -169,19 +196,19 @@ def current_user(db, token: Optional[str]) -> Optional[dict]:
 
 def login(db, username: str, password: str, ip: str = "", ua: str = "") -> dict:
     """登录。成功返回 {"ok": True, "token", "user"}，失败返回 {"ok": False, "key", "params"}。"""
-    left = blocked_seconds(ip)
+    left = blocked_seconds(ip, db)
     if left > 0:
         return {"ok": False, "key": "auth.err.too_many",
                 "params": {"minutes": max(1, left // 60 + 1)}}
 
     u = db.user_get((username or "").strip())
     if not u or not verify_password(password or "", u["pass_hash"]):
-        note_failure(ip)
+        note_failure(ip, db)
         return {"ok": False, "key": "auth.err.bad_credentials", "params": {}}
     if not u["enabled"]:
         return {"ok": False, "key": "auth.err.disabled", "params": {}}
 
-    clear_failures(ip)
+    clear_failures(ip, db)
     now = time.time()
     db.user_update(u["username"], {"last_login_at": now, "last_login_ip": ip or ""})
     u = db.user_get(u["username"])

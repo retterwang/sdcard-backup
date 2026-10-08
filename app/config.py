@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 APP_NAME = "存储卡备份控制台"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # 数据目录：SQLite 索引库、配置（必须持久化——增量判断依赖它）
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -46,4 +46,11 @@ DEFAULT_SETTINGS = {
     "auto_accept": False,    # 是否自动接受未注册的卡；False = 只备份白名单内的卡
     "notify_url": "",        # 任务完成/失败时的 Webhook 通知地址（可选）
     "notify_lang": "zh",     # 完成通知的语言（zh / en），与浏览器界面语言无关
+    "copy_workers": 2,       # 并行复制线程数（1 = 串行；机械盘/网络盘建议 1-2）
+    "adaptive_scan": True,   # 检测间隔自适应：空闲时退避、变化后短时高频
 }
+
+# 是否在 Web 端暴露 OpenAPI 文档（/docs、/openapi.json）。
+# 默认关闭：管理界面对外最小暴露面；调试时用 ENABLE_DOCS=1 打开。
+ENABLE_DOCS = (os.environ.get("ENABLE_DOCS", "0").strip().lower()
+               in ("1", "true", "yes", "on"))
